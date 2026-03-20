@@ -4,6 +4,7 @@ import { useSelector } from 'react-redux';
 import Login from './pages/Login';
 import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
+import DataSources from './pages/DataSources';
 
 function PrivateRoute({ children }) {
   const { token } = useSelector((state) => state.auth);
@@ -19,6 +20,11 @@ function App() {
         <Route path="/dashboard" element={
           <PrivateRoute>
             <Dashboard />
+          </PrivateRoute>
+        } />
+        <Route path="/datasources" element={
+          <PrivateRoute>
+            <DataSources />
           </PrivateRoute>
         } />
         <Route path="/" element={<Navigate to="/login" />} />
