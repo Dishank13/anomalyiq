@@ -5,6 +5,7 @@ import Login from './pages/Login';
 import Register from './pages/Register';
 import Dashboard from './pages/Dashboard';
 import DataSources from './pages/DataSources';
+import AnomalyDetail from './pages/AnomalyDetail';
 
 function PrivateRoute({ children }) {
   const { token } = useSelector((state) => state.auth);
@@ -25,6 +26,11 @@ function App() {
         <Route path="/datasources" element={
           <PrivateRoute>
             <DataSources />
+          </PrivateRoute>
+        } />
+        <Route path="/datasources/:id" element={
+          <PrivateRoute>
+            <AnomalyDetail />
           </PrivateRoute>
         } />
         <Route path="/" element={<Navigate to="/login" />} />
