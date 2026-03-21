@@ -10,11 +10,17 @@ dotenv.config();
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: '*' }
+  cors: {
+    origin: ['https://anomalyiq.vercel.app', 'http://localhost:3000'],
+    credentials: true
+  }
 });
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: ['https://anomalyiq.vercel.app', 'http://localhost:3000'],
+  credentials: true
+}));
 app.use(express.json());
 
 // Routes
