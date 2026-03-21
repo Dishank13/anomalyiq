@@ -22,6 +22,8 @@ services:
     depends_on:
       - mongo
       - redis
+    volumes:
+      - uploads_data:/app/uploads
 
   python-service:
     build: ./python-service
@@ -44,3 +46,4 @@ services:
 
 volumes:
   mongo_data:
+  uploads_data:

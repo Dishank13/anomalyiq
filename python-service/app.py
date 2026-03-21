@@ -6,14 +6,12 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import os
-import google.generativeai as genai
+import requests
 
 app = FastAPI()
 
 # ── Gemini setup
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
 
 # ── Request Models
 class StockRequest(BaseModel):
@@ -121,12 +119,14 @@ def get_severity(z_score: float) -> str:
 
 def explain_anomaly(column: str, value: float, expected_min: float, expected_max: float, recent_values: list, source_name: str) -> dict:
     if not GEMINI_API_KEY:
+        print("NO GEMINI KEY FOUND")
         return {
             "explanation": f"Value {value:.2f} in column '{column}' is outside the expected range of {expected_min:.2f} to {expected_max:.2f}.",
             "suggestion": "Investigate recent changes in this metric."
         }
     try:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        print(f"Calling Gemini for {column}...")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
         prompt = f"""You are a data analyst. A statistical anomaly was detected:
 - Dataset: {source_name}
 - Column: {column}
@@ -138,12 +138,24 @@ In exactly 2 sentences explain why this is anomalous.
 In exactly 1 sentence suggest what to investigate.
 Format: EXPLANATION: <2 sentences> SUGGESTION: <1 sentence>"""
 
-        response = model.generate_content(prompt)
-        text = response.text
+        response = requests.post(url, json={
+            "contents": [{"parts": [{"text": prompt}]}]
+        }, timeout=30)
+
+        print(f"Gemini status: {response.status_code}")
+        data = response.json()
+
+        if response.status_code != 200:
+            print(f"Gemini error response: {data}")
+            raise Exception(f"Gemini API error: {data}")
+
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        print(f"Gemini response: {text[:100]}")
         explanation = text.split("SUGGESTION:")[0].replace("EXPLANATION:", "").strip()
         suggestion = text.split("SUGGESTION:")[1].strip() if "SUGGESTION:" in text else "Investigate this anomaly further."
         return {"explanation": explanation, "suggestion": suggestion}
-    except Exception:
+    except Exception as e:
+        print(f"Gemini error: {e}")
         return {
             "explanation": f"Value {value:.2f} in '{column}' is outside expected range {expected_min:.2f} to {expected_max:.2f}.",
             "suggestion": "Investigate recent changes in this metric."
@@ -214,7 +226,7 @@ def detect_anomalies_iqr(df: pd.DataFrame, column: str, source_name: str) -> lis
             "expected_max": float(upper),
             "z_score": float(z_score),
             "method": "iqr",
-            "severity": float(abs(z_score)) > 3.5 and "high" or "medium",
+            "severity": "high" if abs(z_score) > 3.5 else "medium",
             "explanation": ai["explanation"],
             "suggestion": ai["suggestion"]
         })
@@ -224,7 +236,6 @@ def detect_anomalies_iqr(df: pd.DataFrame, column: str, source_name: str) -> lis
 @app.post("/analyze")
 def analyze(req: AnalyzeRequest):
     try:
-        # Load data
         if req.type == "csv":
             if not req.file_content:
                 raise HTTPException(status_code=400, detail="No file content provided")
@@ -234,27 +245,21 @@ def analyze(req: AnalyzeRequest):
 
         source_name = req.config.get("fileName", "dataset")
 
-        # Get numeric columns only
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         if not numeric_cols:
             raise HTTPException(status_code=400, detail="No numeric columns found for analysis")
 
-        # Limit to first 5 numeric columns to avoid too many API calls
         numeric_cols = numeric_cols[:5]
 
         all_anomalies = []
         for col in numeric_cols:
             zscore_anomalies = detect_anomalies_zscore(df, col, source_name)
             iqr_anomalies = detect_anomalies_iqr(df, col, source_name)
-
-            # Deduplicate — prefer zscore results
             zscore_indices = {a["row_index"] for a in zscore_anomalies}
             unique_iqr = [a for a in iqr_anomalies if a["row_index"] not in zscore_indices]
-
             all_anomalies.extend(zscore_anomalies)
             all_anomalies.extend(unique_iqr)
 
-        # Sort by severity
         severity_order = {"high": 0, "medium": 1, "low": 2}
         all_anomalies.sort(key=lambda x: severity_order.get(x["severity"], 3))
 
