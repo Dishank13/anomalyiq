@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useDispatch, useSelector } from 'react-redux';
 import { logout } from '../store/slices/authSlice';
 import api from '../services/api';
+import socket from '../services/socket';
 
 function AnomalyDetail() {
   const { id } = useParams();
@@ -35,6 +36,22 @@ function AnomalyDetail() {
     };
     fetchData();
   }, [id]);
+  useEffect(() => {
+  socket.connect();
+
+  const handleNewAnomaly = (data) => {
+    if (data.anomaly.dataSourceId === id) {
+      setAnomalies(prev => [data.anomaly, ...prev]);
+    }
+  };
+
+  socket.on('new_anomaly', handleNewAnomaly);
+
+  return () => {
+    socket.off('new_anomaly', handleNewAnomaly);
+    socket.disconnect();
+  };
+}, [id]);
 
   const handleAnalyze = async () => {
     setAnalyzing(true);

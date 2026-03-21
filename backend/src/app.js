@@ -20,7 +20,7 @@ app.use(express.json());
 // Routes
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/datasources', require('./routes/datasources'));
-app.use('/api/anomalies', require('./routes/anomalies'));
+app.use('/api/anomalies', require('./routes/anomalies')(io));
 
 // Test route
 app.get('/', (req, res) => {
