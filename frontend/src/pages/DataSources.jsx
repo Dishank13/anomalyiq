@@ -12,11 +12,14 @@ function DataSources() {
   const { user } = useSelector((state) => state.auth);
 
   const [showForm, setShowForm] = useState(false);
-  const [formType, setFormType] = useState('csv');
+  const [formType, setFormType] = useState('file');
   const [name, setName] = useState('');
   const [file, setFile] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
+
+  const ACCEPTED = ['.csv', '.xlsx', '.xls'];
+  const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 
   useEffect(() => {
     const fetchSources = async () => {
@@ -33,19 +36,32 @@ function DataSources() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    setSubmitting(true);
     setError(null);
 
+    if (!file) {
+      setError('Please choose a file to upload.');
+      return;
+    }
+
+    const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+    if (!ACCEPTED.includes(ext)) {
+      setError('Unsupported file type. Please upload a CSV, XLSX or XLS file.');
+      return;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      setError('File is too large. Maximum upload size is 8MB.');
+      return;
+    }
+
+    setSubmitting(true);
     try {
-      if (formType === 'csv') {
-        const formData = new FormData();
-        formData.append('name', name);
-        formData.append('file', file);
-        const res = await api.post('/api/datasources/csv', formData, {
-          headers: { 'Content-Type': 'multipart/form-data' }
-        });
-        dispatch(addSource(res.data));
-      }
+      const formData = new FormData();
+      formData.append('name', name);
+      formData.append('file', file);
+      const res = await api.post('/api/datasources/file', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      });
+      dispatch(addSource(res.data));
       setShowForm(false);
       setName('');
       setFile(null);
@@ -105,7 +121,7 @@ function DataSources() {
               <div style={styles.formRow}>
                 <label style={styles.label}>Type</label>
                 <select style={styles.input} value={formType} onChange={(e) => setFormType(e.target.value)}>
-                  <option value="csv">CSV Upload</option>
+                  <option value="file">File Upload (CSV or Excel)</option>
                 </select>
               </div>
               <div style={styles.formRow}>
@@ -119,16 +135,19 @@ function DataSources() {
                   required
                 />
               </div>
-              {formType === 'csv' && (
+              {formType === 'file' && (
                 <div style={styles.formRow}>
-                  <label style={styles.label}>CSV File</label>
+                  <label style={styles.label}>Data File</label>
                   <input
                     style={styles.input}
                     type="file"
-                    accept=".csv"
-                    onChange={(e) => setFile(e.target.files[0])}
+                    accept=".csv,.xlsx,.xls,text/csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    onChange={(e) => setFile(e.target.files[0] || null)}
                     required
                   />
+                  <p style={styles.hint}>
+                    CSV, XLSX or XLS · up to 8MB · the first sheet of a workbook is analyzed
+                  </p>
                 </div>
               )}
               <button style={styles.submitBtn} type="submit" disabled={submitting}>
@@ -144,7 +163,7 @@ function DataSources() {
         ) : sources.length === 0 ? (
           <div style={styles.emptyState}>
             <p style={styles.emptyText}>No data sources yet.</p>
-            <p style={styles.emptySubtext}>Add a CSV file to get started.</p>
+            <p style={styles.emptySubtext}>Add a CSV or Excel file to get started.</p>
           </div>
         ) : (
           <div style={styles.grid}>
@@ -195,6 +214,7 @@ const styles = {
   formTitle: { color: '#f1f5f9', marginTop: 0 },
   formRow: { marginBottom: '16px' },
   label: { display: 'block', color: '#94a3b8', marginBottom: '6px', fontSize: '14px' },
+  hint: { color: '#64748b', fontSize: '12px', margin: '6px 0 0 0' },
   input: { width: '100%', padding: '10px', borderRadius: '8px', border: '1px solid #334155', backgroundColor: '#0f172a', color: '#f1f5f9', fontSize: '14px', boxSizing: 'border-box' },
   submitBtn: { padding: '10px 24px', backgroundColor: '#3b82f6', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer' },
   error: { color: '#ef4444', marginBottom: '16px' },

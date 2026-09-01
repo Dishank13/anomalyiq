@@ -13,7 +13,7 @@ const dataSourceSchema = new mongoose.Schema({
   },
   type: {
     type: String,
-    enum: ['csv', 'stock', 'sports'],
+    enum: ['csv', 'excel', 'stock', 'sports'],
     required: true
   },
   config: {
@@ -21,9 +21,19 @@ const dataSourceSchema = new mongoose.Schema({
     sport: String,         // for sports
     league: String,
     team: String,
-    filePath: String       // for CSV uploads
+    fileName: String,      // original upload name, e.g. "sales.xlsx"
+    fileFormat: String,    // csv | xlsx | xls
+    fileSize: Number,      // bytes, before base64 encoding
+    // The uploaded file itself, base64 encoded. Stored in Mongo rather than on
+    // disk because the host filesystem is ephemeral: it is wiped on every
+    // restart, redeploy and idle spin-down, which used to make "Run Analysis"
+    // fail with ENOENT for every source uploaded before the last restart.
+    // select:false keeps it out of list queries — ask for it explicitly with
+    // .select('+config.fileContent') when you actually need to parse the file.
+    fileContent: { type: String, select: false }
   },
   columns: [String],       // detected columns from the data
+  numericColumns: [String],
   rowCount: Number,
   lastFetched: Date,
   status: {

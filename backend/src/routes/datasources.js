@@ -1,39 +1,62 @@
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
 const axios = require('axios');
 const auth = require('../middleware/auth');
 const DataSource = require('../models/DataSource');
 
 const router = express.Router();
 
-// Multer setup for CSV uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadDir = 'uploads/';
-    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    cb(null, `${Date.now()}-${file.originalname}`);
-  }
-});
+// A Mongo document is capped at 16MB and base64 inflates by ~33%, so keep the
+// raw upload well under that ceiling.
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 
+const ALLOWED_EXTENSIONS = {
+  '.csv': 'csv',
+  '.xlsx': 'xlsx',
+  '.xls': 'xls'
+};
+
+// Files are held in memory and persisted to Mongo — never written to the
+// container's disk, which does not survive a restart.
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 },
   fileFilter: (req, file, cb) => {
-    if (path.extname(file.originalname) !== '.csv') {
-      return cb(new Error('Only CSV files allowed'));
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (!ALLOWED_EXTENSIONS[ext]) {
+      const err = new Error('Unsupported file type. Please upload a CSV, XLSX or XLS file.');
+      err.status = 400;   // otherwise the generic handler reports it as a 500
+      return cb(err);
     }
     cb(null, true);
   }
 });
 
+const axiosConfig = {
+  maxBodyLength: Infinity,
+  maxContentLength: Infinity,
+  timeout: 120000
+};
+
+// Turn an axios failure into the message the Python service actually sent,
+// instead of a generic "Server error".
+function pythonError(error) {
+  const detail = error.response?.data?.detail;
+  if (detail) {
+    return { status: error.response.status === 400 ? 400 : 502, message: detail };
+  }
+  if (error.code === 'ECONNREFUSED' || error.code === 'ECONNABORTED') {
+    return { status: 503, message: 'Analysis service is unavailable. Please try again shortly.' };
+  }
+  return { status: 500, message: error.message || 'Server error' };
+}
+
 // GET all data sources for logged in user
+// fileContent is select:false, so this never ships uploaded files to the client.
 router.get('/', auth, async (req, res) => {
   try {
-    const sources = await DataSource.find({ userId: req.user.id });
+    const sources = await DataSource.find({ userId: req.user.id }).sort({ createdAt: -1 });
     res.json(sources);
   } catch (error) {
     res.status(500).json({ message: 'Server error' });
@@ -50,7 +73,8 @@ router.post('/stock', auth, async (req, res) => {
 
     const pythonRes = await axios.post(
       `${process.env.PYTHON_SERVICE_URL}/ingest/stock`,
-      { symbol }
+      { symbol },
+      axiosConfig
     );
 
     const source = await DataSource.create({
@@ -65,45 +89,73 @@ router.post('/stock', auth, async (req, res) => {
 
     res.status(201).json(source);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    const { status, message } = pythonError(error);
+    res.status(status).json({ message });
   }
 });
 
-// POST upload a CSV data source
-router.post('/csv', auth, upload.single('file'), async (req, res) => {
+// POST upload a CSV or Excel data source
+async function handleFileUpload(req, res) {
   try {
     if (!req.file) {
       return res.status(400).json({ message: 'No file uploaded' });
     }
 
     const { name } = req.body;
-    if (!name) {
+    if (!name || !name.trim()) {
       return res.status(400).json({ message: 'Name required' });
     }
 
-    // Read file content and send directly to Python service
-    const fileContent = fs.readFileSync(req.file.path, 'utf8');
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    const fileFormat = ALLOWED_EXTENSIONS[ext];
+    if (!fileFormat) {
+      return res.status(400).json({
+        message: 'Unsupported file type. Please upload a CSV, XLSX or XLS file.'
+      });
+    }
+
+    const fileContent = req.file.buffer.toString('base64');
 
     const pythonRes = await axios.post(
-      `${process.env.PYTHON_SERVICE_URL}/ingest/csv`,
-      { file_content: fileContent, name }
+      `${process.env.PYTHON_SERVICE_URL}/ingest/file`,
+      {
+        file_content: fileContent,
+        name: name.trim(),
+        file_format: fileFormat,
+        encoding: 'base64'
+      },
+      axiosConfig
     );
 
     const source = await DataSource.create({
       userId: req.user.id,
-      name,
-      type: 'csv',
-      config: { filePath: req.file.path, fileName: req.file.originalname },
+      name: name.trim(),
+      type: fileFormat === 'csv' ? 'csv' : 'excel',
+      config: {
+        fileName: req.file.originalname,
+        fileFormat,
+        fileSize: req.file.size,
+        fileContent
+      },
       columns: pythonRes.data.columns,
+      numericColumns: pythonRes.data.numeric_columns || [],
       rowCount: pythonRes.data.row_count,
       lastFetched: new Date()
     });
 
-    res.status(201).json(source);
+    // Strip the stored file out of the response.
+    const payload = source.toObject();
+    delete payload.config.fileContent;
+    res.status(201).json(payload);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    const { status, message } = pythonError(error);
+    res.status(status).json({ message });
   }
-});
+}
+
+router.post('/file', auth, upload.single('file'), handleFileUpload);
+// Retained so an older frontend build keeps working.
+router.post('/csv', auth, upload.single('file'), handleFileUpload);
 
 // GET data for a specific source (for charting)
 router.get('/:id/data', auth, async (req, res) => {
@@ -111,7 +163,7 @@ router.get('/:id/data', auth, async (req, res) => {
     const source = await DataSource.findOne({
       _id: req.params.id,
       userId: req.user.id
-    });
+    }).select('+config.fileContent');
 
     if (!source) {
       return res.status(404).json({ message: 'Data source not found' });
@@ -119,12 +171,21 @@ router.get('/:id/data', auth, async (req, res) => {
 
     const pythonRes = await axios.post(
       `${process.env.PYTHON_SERVICE_URL}/data`,
-      { source_id: source._id, type: source.type, config: source.config }
+      {
+        source_id: source._id.toString(),
+        type: source.type,
+        config: { symbol: source.config.symbol, fileName: source.config.fileName },
+        file_content: source.config.fileContent || null,
+        file_format: source.config.fileFormat || 'csv',
+        encoding: 'base64'
+      },
+      axiosConfig
     );
 
     res.json(pythonRes.data);
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    const { status, message } = pythonError(error);
+    res.status(status).json({ message });
   }
 });
 
@@ -147,3 +208,4 @@ router.delete('/:id', auth, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.MAX_UPLOAD_BYTES = MAX_UPLOAD_BYTES;

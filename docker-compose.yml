@@ -22,8 +22,6 @@ services:
     depends_on:
       - mongo
       - redis
-    volumes:
-      - uploads_data:/app/uploads
 
   python-service:
     build: ./python-service
@@ -31,6 +29,8 @@ services:
       - "8000:8000"
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - MAX_AI_EXPLANATIONS=25
+      - AI_CONCURRENCY=5
 
   mongo:
     image: mongo:7
@@ -46,4 +46,3 @@ services:
 
 volumes:
   mongo_data:
-  uploads_data:

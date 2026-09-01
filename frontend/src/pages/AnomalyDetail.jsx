@@ -17,6 +17,7 @@ function AnomalyDetail() {
   const [analyzing, setAnalyzing] = useState(false);
   const [filter, setFilter] = useState('all');
   const [selected, setSelected] = useState(null);
+  const [notice, setNotice] = useState(null);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -37,30 +38,44 @@ function AnomalyDetail() {
     fetchData();
   }, [id]);
   useEffect(() => {
-  socket.connect();
+    socket.connect();
 
-  const handleNewAnomaly = (data) => {
-    if (data.anomaly.dataSourceId === id) {
-      setAnomalies(prev => [data.anomaly, ...prev]);
-    }
-  };
+    const handleNewAnomaly = (data) => {
+      if (String(data.anomaly.dataSourceId) !== String(id)) return;
+      // The client that triggered the analysis also receives this broadcast,
+      // and already has these rows from the HTTP response. Drop anything we
+      // are already showing instead of listing it twice.
+      setAnomalies((prev) =>
+        prev.some((a) => a._id === data.anomaly._id) ? prev : [data.anomaly, ...prev]
+      );
+    };
 
-  socket.on('new_anomaly', handleNewAnomaly);
+    socket.on('new_anomaly', handleNewAnomaly);
 
-  return () => {
-    socket.off('new_anomaly', handleNewAnomaly);
-    socket.disconnect();
-  };
-}, [id]);
+    return () => {
+      socket.off('new_anomaly', handleNewAnomaly);
+      socket.disconnect();
+    };
+  }, [id]);
 
   const handleAnalyze = async () => {
     setAnalyzing(true);
+    setSelected(null);
+    setNotice(null);
     try {
       const res = await api.post(`/api/anomalies/analyze/${id}`, {});
-      setAnomalies(prev => [...res.data.anomalies, ...prev]);
-      alert(`Analysis complete! Found ${res.data.anomalies.length} new anomalies.`);
+      const found = res.data.anomalies || [];
+      // Analysis replaces the previous run server-side, so mirror that here
+      // rather than appending a second copy of the same findings.
+      setAnomalies(found);
+      setNotice(
+        found.length === 0
+          ? 'Analysis complete — no anomalies detected.'
+          : `Analysis complete — found ${found.length} anomal${found.length === 1 ? 'y' : 'ies'}.` +
+            (res.data.truncated ? ' Showing the most significant results only.' : '')
+      );
     } catch (err) {
-      alert('Analysis failed. Please try again.');
+      setNotice(err.response?.data?.message || 'Analysis failed. Please try again.');
     } finally {
       setAnalyzing(false);
     }
@@ -110,12 +125,14 @@ function AnomalyDetail() {
         <div style={styles.sourceInfo}>
           <div>
             <h2 style={styles.sourceName}>{source?.name}</h2>
-            <p style={styles.sourceMeta}>{source?.rowCount} rows • {source?.columns?.length} columns • CSV</p>
+            <p style={styles.sourceMeta}>{source?.rowCount} rows • {source?.columns?.length} columns • {source?.type?.toUpperCase()}</p>
           </div>
           <button style={styles.analyzeBtn} onClick={handleAnalyze} disabled={analyzing}>
             {analyzing ? '🔍 Analyzing...' : '🔍 Run Analysis'}
           </button>
         </div>
+
+        {notice && <div style={styles.notice}>{notice}</div>}
 
         {/* Stats */}
         <div style={styles.statsRow}>
@@ -231,6 +248,7 @@ const styles = {
   sourceName: { color: '#f1f5f9', margin: '0 0 4px 0', fontSize: '24px' },
   sourceMeta: { color: '#94a3b8', margin: 0 },
   analyzeBtn: { padding: '12px 24px', backgroundColor: '#3b82f6', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '16px' },
+  notice: { backgroundColor: '#1e293b', border: '1px solid #334155', color: '#cbd5e1', padding: '12px 16px', borderRadius: '8px', marginBottom: '20px', fontSize: '14px' },
   statsRow: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '16px', marginBottom: '24px' },
   statCard: { backgroundColor: '#1e293b', padding: '20px', borderRadius: '12px', textAlign: 'center' },
   statNumber: { fontSize: '32px', fontWeight: 'bold', margin: '0 0 4px 0' },
