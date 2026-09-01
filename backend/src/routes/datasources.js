@@ -1,8 +1,8 @@
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const axios = require('axios');
 const auth = require('../middleware/auth');
+const { callPython } = require('../services/pythonService');
 const DataSource = require('../models/DataSource');
 
 const router = express.Router();
@@ -33,25 +33,6 @@ const upload = multer({
   }
 });
 
-const axiosConfig = {
-  maxBodyLength: Infinity,
-  maxContentLength: Infinity,
-  timeout: 120000
-};
-
-// Turn an axios failure into the message the Python service actually sent,
-// instead of a generic "Server error".
-function pythonError(error) {
-  const detail = error.response?.data?.detail;
-  if (detail) {
-    return { status: error.response.status === 400 ? 400 : 502, message: detail };
-  }
-  if (error.code === 'ECONNREFUSED' || error.code === 'ECONNABORTED') {
-    return { status: 503, message: 'Analysis service is unavailable. Please try again shortly.' };
-  }
-  return { status: 500, message: error.message || 'Server error' };
-}
-
 // GET all data sources for logged in user
 // fileContent is select:false, so this never ships uploaded files to the client.
 router.get('/', auth, async (req, res) => {
@@ -71,26 +52,21 @@ router.post('/stock', auth, async (req, res) => {
       return res.status(400).json({ message: 'Name and symbol required' });
     }
 
-    const pythonRes = await axios.post(
-      `${process.env.PYTHON_SERVICE_URL}/ingest/stock`,
-      { symbol },
-      axiosConfig
-    );
+    const pythonData = await callPython('/ingest/stock', { symbol });
 
     const source = await DataSource.create({
       userId: req.user.id,
       name,
       type: 'stock',
       config: { symbol: symbol.toUpperCase() },
-      columns: pythonRes.data.columns,
-      rowCount: pythonRes.data.row_count,
+      columns: pythonData.columns,
+      rowCount: pythonData.row_count,
       lastFetched: new Date()
     });
 
     res.status(201).json(source);
   } catch (error) {
-    const { status, message } = pythonError(error);
-    res.status(status).json({ message });
+    res.status(error.status || 500).json({ message: error.message || 'Server error' });
   }
 });
 
@@ -116,16 +92,12 @@ async function handleFileUpload(req, res) {
 
     const fileContent = req.file.buffer.toString('base64');
 
-    const pythonRes = await axios.post(
-      `${process.env.PYTHON_SERVICE_URL}/ingest/file`,
-      {
-        file_content: fileContent,
-        name: name.trim(),
-        file_format: fileFormat,
-        encoding: 'base64'
-      },
-      axiosConfig
-    );
+    const pythonData = await callPython('/ingest/file', {
+      file_content: fileContent,
+      name: name.trim(),
+      file_format: fileFormat,
+      encoding: 'base64'
+    });
 
     const source = await DataSource.create({
       userId: req.user.id,
@@ -137,9 +109,9 @@ async function handleFileUpload(req, res) {
         fileSize: req.file.size,
         fileContent
       },
-      columns: pythonRes.data.columns,
-      numericColumns: pythonRes.data.numeric_columns || [],
-      rowCount: pythonRes.data.row_count,
+      columns: pythonData.columns,
+      numericColumns: pythonData.numeric_columns || [],
+      rowCount: pythonData.row_count,
       lastFetched: new Date()
     });
 
@@ -148,8 +120,7 @@ async function handleFileUpload(req, res) {
     delete payload.config.fileContent;
     res.status(201).json(payload);
   } catch (error) {
-    const { status, message } = pythonError(error);
-    res.status(status).json({ message });
+    res.status(error.status || 500).json({ message: error.message || 'Server error' });
   }
 }
 
@@ -169,23 +140,18 @@ router.get('/:id/data', auth, async (req, res) => {
       return res.status(404).json({ message: 'Data source not found' });
     }
 
-    const pythonRes = await axios.post(
-      `${process.env.PYTHON_SERVICE_URL}/data`,
-      {
-        source_id: source._id.toString(),
-        type: source.type,
-        config: { symbol: source.config.symbol, fileName: source.config.fileName },
-        file_content: source.config.fileContent || null,
-        file_format: source.config.fileFormat || 'csv',
-        encoding: 'base64'
-      },
-      axiosConfig
-    );
+    const pythonData = await callPython('/data', {
+      source_id: source._id.toString(),
+      type: source.type,
+      config: { symbol: source.config.symbol, fileName: source.config.fileName },
+      file_content: source.config.fileContent || null,
+      file_format: source.config.fileFormat || 'csv',
+      encoding: 'base64'
+    });
 
-    res.json(pythonRes.data);
+    res.json(pythonData);
   } catch (error) {
-    const { status, message } = pythonError(error);
-    res.status(status).json({ message });
+    res.status(error.status || 500).json({ message: error.message || 'Server error' });
   }
 });
 

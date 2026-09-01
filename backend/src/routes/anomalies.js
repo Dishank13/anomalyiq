@@ -1,25 +1,8 @@
 const express = require('express');
-const axios = require('axios');
 const auth = require('../middleware/auth');
+const { callPython } = require('../services/pythonService');
 const Anomaly = require('../models/Anomaly');
 const DataSource = require('../models/DataSource');
-
-const axiosConfig = {
-  maxBodyLength: Infinity,
-  maxContentLength: Infinity,
-  timeout: 120000
-};
-
-function pythonError(error) {
-  const detail = error.response?.data?.detail;
-  if (detail) {
-    return { status: error.response.status === 400 ? 400 : 502, message: detail };
-  }
-  if (error.code === 'ECONNREFUSED' || error.code === 'ECONNABORTED') {
-    return { status: 503, message: 'Analysis service is unavailable. Please try again shortly.' };
-  }
-  return { status: 500, message: error.message || 'Server error' };
-}
 
 module.exports = (io) => {
   const router = express.Router();
@@ -77,24 +60,20 @@ module.exports = (io) => {
         });
       }
 
-      const pythonRes = await axios.post(
-        `${process.env.PYTHON_SERVICE_URL}/analyze`,
-        {
-          source_id: source._id.toString(),
-          type: source.type,
-          config: {
-            fileName: source.config.fileName,
-            name: source.name
-          },
-          file_content: source.config.fileContent,
-          file_format: source.config.fileFormat || 'csv',
-          encoding: 'base64',
-          columns: source.columns
+      const pythonData = await callPython('/analyze', {
+        source_id: source._id.toString(),
+        type: source.type,
+        config: {
+          fileName: source.config.fileName,
+          name: source.name
         },
-        axiosConfig
-      );
+        file_content: source.config.fileContent,
+        file_format: source.config.fileFormat || 'csv',
+        encoding: 'base64',
+        columns: source.columns
+      });
 
-      const detectedAnomalies = pythonRes.data.anomalies || [];
+      const detectedAnomalies = pythonData.anomalies || [];
 
       if (detectedAnomalies.length === 0) {
         return res.json({ message: 'No anomalies detected', anomalies: [] });
@@ -131,12 +110,11 @@ module.exports = (io) => {
       res.json({
         message: `Found ${savedAnomalies.length} anomalies`,
         anomalies: savedAnomalies,
-        truncated: Boolean(pythonRes.data.truncated),
-        columnsAnalyzed: pythonRes.data.columns_analyzed || []
+        truncated: Boolean(pythonData.truncated),
+        columnsAnalyzed: pythonData.columns_analyzed || []
       });
     } catch (error) {
-      const { status, message } = pythonError(error);
-      res.status(status).json({ message });
+      res.status(error.status || 500).json({ message: error.message || 'Server error' });
     }
   });
 
