@@ -1,4 +1,5 @@
 const axios = require('axios');
+const logger = require('../lib/logger');
 
 // Render free instances spin down after 15 minutes, so the first call after an
 // idle period can take ~50s to wake the service.
@@ -72,23 +73,35 @@ function describeError(error) {
   return { status: 500, message: error.message || 'Server error' };
 }
 
-async function callPython(path, payload) {
+/**
+ * Call the python service.
+ *
+ * `requestId` is forwarded as X-Request-Id so a single analysis can be traced
+ * across all three services in the logs -- otherwise a failure in python is
+ * impossible to line up with the API request that caused it.
+ */
+async function callPython(path, payload, { requestId } = {}) {
   const url = `${process.env.PYTHON_SERVICE_URL}${path}`;
+  const log = logger.child({ requestId, upstream: path });
   let lastError;
 
   for (let attempt = 0; attempt < 2; attempt++) {
+    const startedAt = Date.now();
     try {
       const res = await axios.post(url, payload, {
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
-        timeout: REQUEST_TIMEOUT
+        timeout: REQUEST_TIMEOUT,
+        headers: requestId ? { 'X-Request-Id': requestId } : {}
       });
+      log.info({ ms: Date.now() - startedAt, attempt }, 'python call succeeded');
       return res.data;
     } catch (error) {
       lastError = error;
       if (attempt === 0 && isRetryable(error)) {
-        console.warn(
-          `python ${path} failed (${error.response ? error.response.status : error.code}); retrying once`
+        log.warn(
+          { status: error.response ? error.response.status : error.code, ms: Date.now() - startedAt },
+          'python call failed, retrying once'
         );
         await sleep(RETRY_DELAY_MS);
         continue;
@@ -102,8 +115,9 @@ async function callPython(path, payload) {
   err.status = status;
   err.upstreamStatus = lastError.response ? lastError.response.status : null;
   err.upstreamCode = lastError.code || null;
-  console.error(
-    `python ${path} -> ${status} (upstream ${err.upstreamStatus || err.upstreamCode}): ${message}`
+  log.error(
+    { status, upstreamStatus: err.upstreamStatus, upstreamCode: err.upstreamCode },
+    message
   );
   throw err;
 }

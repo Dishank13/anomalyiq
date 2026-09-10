@@ -4,6 +4,7 @@ const path = require('path');
 const auth = require('../middleware/auth');
 const { callPython } = require('../services/pythonService');
 const DataSource = require('../models/DataSource');
+const logger = require('../lib/logger');
 
 const router = express.Router();
 
@@ -40,6 +41,7 @@ router.get('/', auth, async (req, res) => {
     const sources = await DataSource.find({ userId: req.user.id }).sort({ createdAt: -1 });
     res.json(sources);
   } catch (error) {
+    logger.error({ err: error }, 'list data sources failed');
     res.status(500).json({ message: 'Server error' });
   }
 });
@@ -52,7 +54,7 @@ router.post('/stock', auth, async (req, res) => {
       return res.status(400).json({ message: 'Name and symbol required' });
     }
 
-    const pythonData = await callPython('/ingest/stock', { symbol });
+    const pythonData = await callPython('/ingest/stock', { symbol }, { requestId: req.id });
 
     const source = await DataSource.create({
       userId: req.user.id,
@@ -97,7 +99,7 @@ async function handleFileUpload(req, res) {
       name: name.trim(),
       file_format: fileFormat,
       encoding: 'base64'
-    });
+    }, { requestId: req.id });
 
     const source = await DataSource.create({
       userId: req.user.id,
@@ -128,6 +130,22 @@ router.post('/file', auth, upload.single('file'), handleFileUpload);
 // Retained so an older frontend build keeps working.
 router.post('/csv', auth, upload.single('file'), handleFileUpload);
 
+// GET one data source.
+// AnomalyDetail used to fetch the entire source list and find() the one it
+// wanted client-side, which grows worse with every upload.
+router.get('/:id', auth, async (req, res) => {
+  try {
+    const source = await DataSource.findOne({ _id: req.params.id, userId: req.user.id });
+    if (!source) {
+      return res.status(404).json({ message: 'Data source not found' });
+    }
+    res.json(source);
+  } catch (error) {
+    logger.error({ err: error, sourceId: req.params.id }, 'fetch data source failed');
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 // GET data for a specific source (for charting)
 router.get('/:id/data', auth, async (req, res) => {
   try {
@@ -147,7 +165,7 @@ router.get('/:id/data', auth, async (req, res) => {
       file_content: source.config.fileContent || null,
       file_format: source.config.fileFormat || 'csv',
       encoding: 'base64'
-    });
+    }, { requestId: req.id });
 
     res.json(pythonData);
   } catch (error) {

@@ -39,4 +39,10 @@ const anomalySchema = new mongoose.Schema({
   }
 }, { timestamps: true });
 
+// Every read of this collection is scoped to one user, and usually to one data
+// source, newest first. Without these the list endpoints were full collection
+// scans that got slower with every analysis anyone ran.
+anomalySchema.index({ userId: 1, dataSourceId: 1, createdAt: -1 });
+anomalySchema.index({ userId: 1, createdAt: -1 });
+
 module.exports = mongoose.model('Anomaly', anomalySchema);

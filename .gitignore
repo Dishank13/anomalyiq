@@ -8,3 +8,5 @@ chroma_db/
 dist/
 build/
 .DS_Store
+# Tooling scratch state, not project code
+.claude-flow/

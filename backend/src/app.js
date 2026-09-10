@@ -3,13 +3,32 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const http = require('http');
+const crypto = require('crypto');
 const multer = require('multer');
+const helmet = require('helmet');
+const axios = require('axios');
+const rateLimit = require('express-rate-limit');
+const pinoHttp = require('pino-http');
 const { Server } = require('socket.io');
+
+const logger = require('./lib/logger');
+const { registerSocketAuth } = require('./socket');
 
 dotenv.config();
 
+if (!process.env.JWT_SECRET) {
+  // Failing loudly at boot beats signing tokens with `undefined` and only
+  // finding out when every login silently stops verifying.
+  logger.fatal('JWT_SECRET is not set - refusing to start');
+  process.exit(1);
+}
+
 const app = express();
 const server = http.createServer(app);
+
+// Render terminates TLS at its proxy, so without this every request appears to
+// come from the same address and the rate limiter would throttle all users as one.
+app.set('trust proxy', 1);
 
 // Allow the production frontend, local dev, Vercel preview deployments, and
 // anything set via CORS_ORIGINS (comma separated).
@@ -31,20 +50,94 @@ const corsOrigin = (origin, callback) => {
 const io = new Server(server, {
   cors: { origin: corsOrigin, credentials: true }
 });
+registerSocketAuth(io);
 
-// Middleware
+// ── Middleware
+app.use(helmet({
+  // This is a JSON API consumed by a browser app on another origin; the
+  // default same-origin resource policy would block it.
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  contentSecurityPolicy: false
+}));
+
+app.use(pinoHttp({
+  logger,
+  // Reuse an upstream id when there is one so a trace survives across hops.
+  genReqId: (req) => req.headers['x-request-id'] || crypto.randomUUID(),
+  customLogLevel: (req, res, err) => {
+    if (err || res.statusCode >= 500) return 'error';
+    if (res.statusCode >= 400) return 'warn';
+    // Health checks would otherwise dominate the logs.
+    if (req.url === '/healthz' || req.url === '/readyz') return 'silent';
+    return 'info';
+  }
+}));
+
 app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
-// Routes
+// Broad ceiling against runaway clients.
+app.use('/api', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.RATE_LIMIT_MAX || 300),
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { message: 'Too many requests. Please slow down and try again shortly.' }
+}));
+
+// Credential endpoints get their own, much tighter budget: login previously
+// accepted unlimited attempts, which is a free offline-speed password oracle.
+app.use('/api/auth/login', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.AUTH_RATE_LIMIT_MAX || 10),
+  skipSuccessfulRequests: true,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { message: 'Too many login attempts. Please try again in a few minutes.' }
+}));
+app.use('/api/auth/register', rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: Number(process.env.REGISTER_RATE_LIMIT_MAX || 10),
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { message: 'Too many accounts created from this address. Please try again later.' }
+}));
+
+// ── Routes
 app.use('/api/auth', require('./routes/auth'));
 app.use('/api/datasources', require('./routes/datasources'));
 app.use('/api/anomalies', require('./routes/anomalies')(io));
 
-// Test route
 app.get('/', (req, res) => {
   res.json({ message: 'AnomalyIQ backend is running!' });
+});
+
+// Liveness: is this process up? Deliberately checks nothing else, so a
+// degraded dependency does not get the container killed and restarted.
+app.get('/healthz', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() });
+});
+
+// Readiness: can this process actually serve traffic?
+app.get('/readyz', async (req, res) => {
+  const mongoUp = mongoose.connection.readyState === 1;
+
+  let pythonUp = false;
+  try {
+    const probe = await axios.get(`${process.env.PYTHON_SERVICE_URL}/healthz`, { timeout: 3000 });
+    pythonUp = probe.status === 200;
+  } catch (err) {
+    pythonUp = false;
+  }
+
+  // Mongo is required to serve anything; the python service only gates
+  // analysis, so a cold one is reported but not treated as failure.
+  const ready = mongoUp;
+  res.status(ready ? 200 : 503).json({
+    status: ready ? 'ready' : 'not ready',
+    checks: { mongo: mongoUp, pythonService: pythonUp }
+  });
 });
 
 app.use((req, res) => {
@@ -65,24 +158,26 @@ app.use((err, req, res, next) => {
   if (err && /Not allowed by CORS/.test(err.message)) {
     return res.status(403).json({ message: err.message });
   }
-  console.error('Unhandled error:', err);
-  res.status(err.status || 500).json({ message: err.message || 'Server error' });
+  if (err && err.status && err.status < 500) {
+    return res.status(err.status).json({ message: err.message });
+  }
+  logger.error({ err, requestId: req.id }, 'unhandled error');
+  res.status(500).json({ message: 'Server error' });
 });
 
-// Socket.io
-io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-  });
-});
+// ── MongoDB
+const { ensureIndexes } = require('./lib/indexes');
 
-// MongoDB connection
 mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('MongoDB connected'))
-  .catch(err => console.error('MongoDB error:', err));
+  .then(async () => {
+    logger.info('MongoDB connected');
+    await ensureIndexes();
+  })
+  .catch((err) => logger.error({ err }, 'MongoDB connection failed'));
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`Backend running on port ${PORT}`);
+  logger.info({ port: PORT }, 'backend listening');
 });
+
+module.exports = { app, server, io };

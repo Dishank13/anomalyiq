@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional, List, Any
 from io import StringIO, BytesIO
@@ -254,10 +254,52 @@ def coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ── Request correlation
+# The Node backend forwards its request id as X-Request-Id. Echoing it back and
+# logging it is what makes a single analysis traceable across all three
+# services -- without it, a failure here cannot be lined up with the API call
+# that caused it.
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-Id", "-")
+    response = await call_next(request)
+    response.headers["X-Request-Id"] = request_id
+    if request.url.path not in ("/healthz", "/readyz", "/health"):
+        print("[%s] %s %s -> %s" % (request_id, request.method,
+                                    request.url.path, response.status_code),
+              flush=True)
+    return response
+
+
 # ── Health
 @app.get("/")
 def root():
     return {"message": "AnomalyIQ Python service is running!"}
+
+
+# Liveness: is the process up? Checks nothing else on purpose, so a degraded
+# dependency cannot get the container restarted.
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
+# Readiness: can this process actually do the work it exists for?
+@app.get("/readyz")
+def readyz():
+    with _AI_STATUS_LOCK:
+        ai = dict(AI_STATUS)
+    # Detection is the core capability and needs no external service, so the
+    # process is ready even when Gemini is down -- explanations simply fall
+    # back to deterministic text.
+    return {
+        "status": "ready",
+        "checks": {
+            "detection": True,
+            "aiExplanations": ai["last_ok"],
+            "aiConfigured": ai["configured"],
+        },
+    }
 
 
 @app.get("/health")

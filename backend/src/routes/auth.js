@@ -1,86 +1,67 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const User = require('../models/User');
+const auth = require('../middleware/auth');
+const logger = require('../lib/logger');
+const { validateBody, registerSchema, loginSchema } = require('../middleware/validate');
 
 const router = express.Router();
 
+const TOKEN_TTL = '7d';
+
+const signToken = (user) =>
+  jwt.sign({ id: user._id, email: user.email }, process.env.JWT_SECRET, { expiresIn: TOKEN_TTL });
+
+const publicUser = (user) => ({ id: user._id, name: user.name, email: user.email });
+
 // Register
-router.post('/register', async (req, res) => {
+router.post('/register', validateBody(registerSchema), async (req, res) => {
+  const { name, email, password } = req.body;
   try {
-    const { name, email, password } = req.body;
-
-    // Check if user already exists
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ message: 'Email already in use' });
-    }
-
-    // Create user
     const user = await User.create({ name, email, password });
-
-    // Generate token
-    const token = jwt.sign(
-      { id: user._id, email: user.email },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.status(201).json({
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email
-      }
-    });
+    res.status(201).json({ token: signToken(user), user: publicUser(user) });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    // The unique index on email is the real guard against duplicates. A
+    // findOne() check beforehand loses the race between two concurrent
+    // signups; catching E11000 does not.
+    if (error.code === 11000) {
+      return res.status(409).json({ message: 'Email already in use' });
+    }
+    // Previously this returned error.message to the client, which leaked
+    // driver and schema internals on any unexpected failure.
+    logger.error({ err: error }, 'register failed');
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
 // Login
-router.post('/login', async (req, res) => {
+router.post('/login', validateBody(loginSchema), async (req, res) => {
+  const { email, password } = req.body;
   try {
-    const { email, password } = req.body;
-
-    // Find user
     const user = await User.findOne({ email });
-    if (!user) {
+    // Same response either way, so the endpoint cannot be used to discover
+    // which email addresses are registered.
+    const isMatch = user ? await user.comparePassword(password) : false;
+    if (!user || !isMatch) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
-
-    // Check password
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) {
-      return res.status(401).json({ message: 'Invalid credentials' });
-    }
-
-    // Generate token
-    const token = jwt.sign(
-      { id: user._id, email: user.email },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.status(200).json({
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email
-      }
-    });
+    res.json({ token: signToken(user), user: publicUser(user) });
   } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    logger.error({ err: error }, 'login failed');
+    res.status(500).json({ message: 'Server error' });
   }
 });
 
-// Get current user (protected route)
-router.get('/me', require('../middleware/auth'), async (req, res) => {
+// Current user
+router.get('/me', auth, async (req, res) => {
   try {
     const user = await User.findById(req.user.id).select('-password');
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
     res.json(user);
   } catch (error) {
+    logger.error({ err: error }, 'fetch current user failed');
     res.status(500).json({ message: 'Server error' });
   }
 });

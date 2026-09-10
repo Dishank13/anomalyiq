@@ -22,15 +22,17 @@ function AnomalyDetail() {
   useEffect(() => {
     const fetchData = async () => {
       try {
-        const [sourcesRes, anomaliesRes] = await Promise.all([
-          api.get('/api/datasources'),
+        // Fetch just this source rather than pulling the whole list and
+        // filtering client-side.
+        const [sourceRes, anomaliesRes] = await Promise.all([
+          api.get(`/api/datasources/${id}`),
           api.get(`/api/anomalies/source/${id}`)
         ]);
-        const src = sourcesRes.data.find(s => s._id === id);
-        setSource(src);
-        setAnomalies(anomaliesRes.data);
+        setSource(sourceRes.data);
+        // The list endpoints are paginated now: { items, total, page, limit }.
+        setAnomalies(anomaliesRes.data.items || []);
       } catch (err) {
-        console.error(err);
+        setNotice(err.response?.data?.message || 'Could not load this data source.');
       } finally {
         setLoading(false);
       }
@@ -39,6 +41,15 @@ function AnomalyDetail() {
   }, [id]);
   useEffect(() => {
     socket.connect();
+
+    // The server now rejects unauthenticated handshakes, so a stale or expired
+    // token surfaces here instead of silently never delivering events.
+    const handleConnectError = (err) => {
+      if (/unauthorized/i.test(err.message)) {
+        setNotice('Live updates are unavailable — your session may have expired. Sign in again.');
+      }
+    };
+    socket.on('connect_error', handleConnectError);
 
     const handleNewAnomaly = (data) => {
       if (String(data.anomaly.dataSourceId) !== String(id)) return;
@@ -54,6 +65,7 @@ function AnomalyDetail() {
 
     return () => {
       socket.off('new_anomaly', handleNewAnomaly);
+      socket.off('connect_error', handleConnectError);
       socket.disconnect();
     };
   }, [id]);

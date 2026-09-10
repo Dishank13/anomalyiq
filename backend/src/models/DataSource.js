@@ -43,4 +43,7 @@ const dataSourceSchema = new mongoose.Schema({
   }
 }, { timestamps: true });
 
+// Matches the only query shape used: one user's sources, newest first.
+dataSourceSchema.index({ userId: 1, createdAt: -1 });
+
 module.exports = mongoose.model('DataSource', dataSourceSchema);

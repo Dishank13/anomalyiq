@@ -1,20 +1,31 @@
 const express = require('express');
 const auth = require('../middleware/auth');
 const { callPython } = require('../services/pythonService');
+const { emitToUser } = require('../socket');
+const { pagination } = require('../middleware/validate');
+const logger = require('../lib/logger');
 const Anomaly = require('../models/Anomaly');
 const DataSource = require('../models/DataSource');
 
 module.exports = (io) => {
   const router = express.Router();
 
-  // GET all anomalies for logged in user
+  // GET all anomalies for the logged in user
   router.get('/', auth, async (req, res) => {
     try {
-      const anomalies = await Anomaly.find({ userId: req.user.id })
-        .populate('dataSourceId', 'name type')
-        .sort({ createdAt: -1 });
-      res.json(anomalies);
+      const { limit, page, skip } = pagination(req.query);
+      const filter = { userId: req.user.id };
+      const [items, total] = await Promise.all([
+        Anomaly.find(filter)
+          .populate('dataSourceId', 'name type')
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(limit),
+        Anomaly.countDocuments(filter)
+      ]);
+      res.json({ items, total, page, limit });
     } catch (error) {
+      logger.error({ err: error }, 'list anomalies failed');
       res.status(500).json({ message: 'Server error' });
     }
   });
@@ -22,12 +33,15 @@ module.exports = (io) => {
   // GET anomalies for a specific data source
   router.get('/source/:sourceId', auth, async (req, res) => {
     try {
-      const anomalies = await Anomaly.find({
-        userId: req.user.id,
-        dataSourceId: req.params.sourceId
-      }).sort({ createdAt: -1 });
-      res.json(anomalies);
+      const { limit, page, skip } = pagination(req.query);
+      const filter = { userId: req.user.id, dataSourceId: req.params.sourceId };
+      const [items, total] = await Promise.all([
+        Anomaly.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
+        Anomaly.countDocuments(filter)
+      ]);
+      res.json({ items, total, page, limit });
     } catch (error) {
+      logger.error({ err: error, sourceId: req.params.sourceId }, 'list source anomalies failed');
       res.status(500).json({ message: 'Server error' });
     }
   });
@@ -71,7 +85,7 @@ module.exports = (io) => {
         file_format: source.config.fileFormat || 'csv',
         encoding: 'base64',
         columns: source.columns
-      });
+      }, { requestId: req.id });
 
       const detectedAnomalies = pythonData.anomalies || [];
 
@@ -101,11 +115,17 @@ module.exports = (io) => {
         }))
       );
 
-      // Notify other open tabs/clients. The caller gets the full list in the
-      // HTTP response, and dedupes by _id, so this cannot double-count.
+      // Notify this user's other open tabs -- and only this user's. The caller
+      // gets the full list in the HTTP response and dedupes by _id, so this
+      // cannot double-count.
       for (const saved of savedAnomalies) {
-        io.emit('new_anomaly', { anomaly: saved, sourceName: source.name });
+        emitToUser(io, req.user.id, 'new_anomaly', { anomaly: saved, sourceName: source.name });
       }
+
+      logger.info(
+        { sourceId: source._id.toString(), count: savedAnomalies.length },
+        'analysis complete'
+      );
 
       res.json({
         message: `Found ${savedAnomalies.length} anomalies`,
@@ -114,6 +134,9 @@ module.exports = (io) => {
         columnsAnalyzed: pythonData.columns_analyzed || []
       });
     } catch (error) {
+      if (!error.status || error.status >= 500) {
+        logger.error({ err: error, sourceId: req.params.sourceId }, 'analysis failed');
+      }
       res.status(error.status || 500).json({ message: error.message || 'Server error' });
     }
   });
@@ -131,6 +154,7 @@ module.exports = (io) => {
       }
       res.json(anomaly);
     } catch (error) {
+      logger.error({ err: error }, 'mark anomaly read failed');
       res.status(500).json({ message: 'Server error' });
     }
   });
