@@ -266,6 +266,14 @@ anomalyiq/
 
 ---
 
+## Technical report
+
+[`AnomalyIQ_Technical_Report.pdf`](AnomalyIQ_Technical_Report.pdf) covers the
+architecture, the detection mathematics, the benchmark method and results, the job
+pipeline, and a section on defects found and fixed.
+
+---
+
 ## Author
 
 **Dishank Shah**  
