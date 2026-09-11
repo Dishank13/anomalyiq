@@ -74,6 +74,16 @@ module.exports = (io) => {
         });
       }
 
+      // Analysis options come from the request body so the UI can drive them.
+      // Anything omitted is left undefined rather than defaulted here, so the
+      // python service owns the defaults in one place.
+      //
+      // Note this used to send `columns: source.columns` -- every column in
+      // the file. The python service ignored it, so it was harmless; now that
+      // column selection actually works, sending all of them would silently
+      // widen every analysis.
+      const { columns, methods, zThreshold, window: win, stlPeriod } = req.body || {};
+
       const pythonData = await callPython('/analyze', {
         source_id: source._id.toString(),
         type: source.type,
@@ -84,7 +94,11 @@ module.exports = (io) => {
         file_content: source.config.fileContent,
         file_format: source.config.fileFormat || 'csv',
         encoding: 'base64',
-        columns: source.columns
+        columns: Array.isArray(columns) && columns.length ? columns : undefined,
+        methods: Array.isArray(methods) && methods.length ? methods : undefined,
+        z_threshold: typeof zThreshold === 'number' ? zThreshold : undefined,
+        window: typeof win === 'number' ? win : undefined,
+        stl_period: typeof stlPeriod === 'number' ? stlPeriod : undefined
       }, { requestId: req.id });
 
       const detectedAnomalies = pythonData.anomalies || [];
@@ -131,7 +145,10 @@ module.exports = (io) => {
         message: `Found ${savedAnomalies.length} anomalies`,
         anomalies: savedAnomalies,
         truncated: Boolean(pythonData.truncated),
-        columnsAnalyzed: pythonData.columns_analyzed || []
+        columnsAnalyzed: pythonData.columns_analyzed || [],
+        // So the UI can offer the columns this run did not cover.
+        numericColumns: pythonData.numeric_columns || [],
+        methodsUsed: pythonData.methods_used || []
       });
     } catch (error) {
       if (!error.status || error.status >= 500) {

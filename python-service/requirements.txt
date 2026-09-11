@@ -7,3 +7,11 @@ openpyxl==3.1.2
 xlrd==2.0.1
 python-multipart==0.0.6
 requests==2.31.0
+
+# Detection methods beyond z-score/IQR. Both are imported lazily inside their
+# detector, so they stay off the cold-start path; /health reports which
+# methods a deployment can actually run rather than letting a missing
+# dependency degrade into "no anomalies found".
+scipy==1.12.0           # statsmodels dependency
+statsmodels==0.14.1     # STL seasonal decomposition
+scikit-learn==1.4.0     # Isolation Forest (multivariate)

@@ -10,3 +10,4 @@ build/
 .DS_Store
 # Tooling scratch state, not project code
 .claude-flow/
+python-service/log/

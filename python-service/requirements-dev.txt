@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Benchmark and regression suite: pytest bench/
+pytest==8.0.0
