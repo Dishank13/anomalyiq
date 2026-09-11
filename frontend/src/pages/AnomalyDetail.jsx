@@ -18,6 +18,7 @@ function AnomalyDetail() {
   const [filter, setFilter] = useState('all');
   const [selected, setSelected] = useState(null);
   const [notice, setNotice] = useState(null);
+  const [job, setJob] = useState(null);        // { jobId, status, progress, stage }
 
   useEffect(() => {
     const fetchData = async () => {
@@ -61,34 +62,122 @@ function AnomalyDetail() {
       );
     };
 
+    // Analysis is a job now, so its lifecycle arrives as events rather than as
+    // one blocking HTTP response.
+    const forThisSource = (d) => !d.sourceId || String(d.sourceId) === String(id);
+
+    const handleProgress = (d) => {
+      if (!forThisSource(d)) return;
+      setJob({ jobId: d.jobId, status: d.status || 'running',
+               progress: d.progress != null ? d.progress : 0, stage: d.stage });
+    };
+
+    const handleCompleted = async (d) => {
+      if (!forThisSource(d)) return;
+      setJob({ jobId: d.jobId, status: 'succeeded', progress: 100 });
+      setAnalyzing(false);
+      // The queued path never sent the rows over HTTP, so read them back.
+      try {
+        const res = await api.get('/api/anomalies/source/' + id);
+        setAnomalies(res.data.items || []);
+      } catch (err) { /* the notice below still reports what happened */ }
+      setNotice(
+        d.anomalyCount
+          ? 'Analysis complete - found ' + d.anomalyCount + ' anomal' +
+            (d.anomalyCount === 1 ? 'y' : 'ies') + '.' +
+            (d.truncated ? ' Showing the most significant results only.' : '')
+          : 'Analysis complete - no anomalies detected.'
+      );
+    };
+
+    const handleFailed = (d) => {
+      if (!forThisSource(d)) return;
+      setJob({ jobId: d.jobId, status: 'failed', progress: 0 });
+      setAnalyzing(false);
+      setNotice(d.error || 'Analysis failed. Please try again.');
+    };
+
     socket.on('new_anomaly', handleNewAnomaly);
+    socket.on('analysis:queued', handleProgress);
+    socket.on('analysis:running', handleProgress);
+    socket.on('analysis:progress', handleProgress);
+    socket.on('analysis:completed', handleCompleted);
+    socket.on('analysis:failed', handleFailed);
 
     return () => {
       socket.off('new_anomaly', handleNewAnomaly);
+      socket.off('analysis:queued', handleProgress);
+      socket.off('analysis:running', handleProgress);
+      socket.off('analysis:progress', handleProgress);
+      socket.off('analysis:completed', handleCompleted);
+      socket.off('analysis:failed', handleFailed);
       socket.off('connect_error', handleConnectError);
       socket.disconnect();
     };
   }, [id]);
 
+  // Poll fallback for when socket events do not arrive -- a dropped connection
+  // or a blocked websocket must not leave a running job looking stuck forever.
+  const pollRun = async (jobId) => {
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        const { data } = await api.get('/api/anomalies/runs/' + encodeURIComponent(jobId));
+        setJob({ jobId, status: data.status, progress: data.progress, stage: data.stage });
+        if (data.status === 'succeeded') {
+          const res = await api.get('/api/anomalies/source/' + id);
+          setAnomalies(res.data.items || []);
+          setAnalyzing(false);
+          setNotice(data.anomalyCount
+            ? 'Analysis complete - found ' + data.anomalyCount + ' anomalies.'
+            : 'Analysis complete - no anomalies detected.');
+          return;
+        }
+        if (data.status === 'failed') {
+          setAnalyzing(false);
+          setNotice(data.error || 'Analysis failed. Please try again.');
+          return;
+        }
+      } catch (err) {
+        return;   // the run is gone or unreadable; stop polling
+      }
+    }
+  };
+
   const handleAnalyze = async () => {
     setAnalyzing(true);
     setSelected(null);
     setNotice(null);
+    setJob(null);
     try {
-      const res = await api.post(`/api/anomalies/analyze/${id}`, {});
-      const found = res.data.anomalies || [];
-      // Analysis replaces the previous run server-side, so mirror that here
-      // rather than appending a second copy of the same findings.
-      setAnomalies(found);
-      setNotice(
-        found.length === 0
-          ? 'Analysis complete — no anomalies detected.'
-          : `Analysis complete — found ${found.length} anomal${found.length === 1 ? 'y' : 'ies'}.` +
-            (res.data.truncated ? ' Showing the most significant results only.' : '')
-      );
+      const res = await api.post('/api/anomalies/analyze/' + id, {});
+
+      // Inline mode did the work inside the request and returned the rows.
+      if (res.data.mode === 'inline') {
+        const found = res.data.anomalies || [];
+        setAnomalies(found);
+        setNotice(
+          found.length === 0
+            ? 'Analysis complete - no anomalies detected.'
+            : 'Analysis complete - found ' + found.length + ' anomal' +
+              (found.length === 1 ? 'y' : 'ies') + '.' +
+              (res.data.truncated ? ' Showing the most significant results only.' : '')
+        );
+        setAnalyzing(false);
+        return;
+      }
+
+      // Queued: the response is a receipt. Progress arrives over the socket,
+      // and the poll is there in case it does not.
+      setJob({ jobId: res.data.jobId, status: res.data.status || 'queued', progress: 0 });
+      setNotice(res.data.deduplicated
+        ? 'This analysis is already running - following the existing job.'
+        : 'Analysis queued...');
+      pollRun(res.data.jobId);
     } catch (err) {
-      setNotice(err.response?.data?.message || 'Analysis failed. Please try again.');
-    } finally {
+      const msg = (err.response && err.response.data && err.response.data.message) ||
+                  'Analysis failed. Please try again.';
+      setNotice(msg);
       setAnalyzing(false);
     }
   };
@@ -143,6 +232,18 @@ function AnomalyDetail() {
             {analyzing ? '🔍 Analyzing...' : '🔍 Run Analysis'}
           </button>
         </div>
+
+        {job && ['queued', 'running'].includes(job.status) && (
+          <div style={styles.progressWrap}>
+            <div style={styles.progressHead}>
+              <span>{job.stage || (job.status === 'queued' ? 'queued' : 'running')}</span>
+              <span style={styles.progressPct}>{job.progress || 0}%</span>
+            </div>
+            <div style={styles.progressTrack}>
+              <div style={{ ...styles.progressBar, width: (job.progress || 0) + '%' }} />
+            </div>
+          </div>
+        )}
 
         {notice && <div style={styles.notice}>{notice}</div>}
 
@@ -261,6 +362,11 @@ const styles = {
   sourceMeta: { color: '#94a3b8', margin: 0 },
   analyzeBtn: { padding: '12px 24px', backgroundColor: '#3b82f6', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '16px' },
   notice: { backgroundColor: '#1e293b', border: '1px solid #334155', color: '#cbd5e1', padding: '12px 16px', borderRadius: '8px', marginBottom: '20px', fontSize: '14px' },
+  progressWrap: { backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '8px', padding: '12px 16px', marginBottom: '12px' },
+  progressHead: { display: 'flex', justifyContent: 'space-between', color: '#cbd5e1', fontSize: '13px', marginBottom: '8px', textTransform: 'capitalize' },
+  progressPct: { color: '#94a3b8' },
+  progressTrack: { height: '6px', backgroundColor: '#0f172a', borderRadius: '3px', overflow: 'hidden' },
+  progressBar: { height: '100%', backgroundColor: '#3b82f6', borderRadius: '3px', transition: 'width 240ms ease' },
   statsRow: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '16px', marginBottom: '24px' },
   statCard: { backgroundColor: '#1e293b', padding: '20px', borderRadius: '12px', textAlign: 'center' },
   statNumber: { fontSize: '32px', fontWeight: 'bold', margin: '0 0 4px 0' },

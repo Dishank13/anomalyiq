@@ -11,3 +11,6 @@ build/
 # Tooling scratch state, not project code
 .claude-flow/
 python-service/log/
+
+# Local verification scratch files
+.verify_*.js

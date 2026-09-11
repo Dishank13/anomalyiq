@@ -11,8 +11,12 @@ const rateLimit = require('express-rate-limit');
 const pinoHttp = require('pino-http');
 const { Server } = require('socket.io');
 
+const { createAdapter } = require('@socket.io/redis-adapter');
+
 const logger = require('./lib/logger');
 const { registerSocketAuth } = require('./socket');
+const { createConnection, isConfigured: redisConfigured } = require('./queue/connection');
+const analysisQueue = require('./queue/analysisQueue');
 
 dotenv.config();
 
@@ -50,7 +54,23 @@ const corsOrigin = (origin, callback) => {
 const io = new Server(server, {
   cors: { origin: corsOrigin, credentials: true }
 });
+
+// With the Redis adapter, an emit from the worker process reaches sockets held
+// by this one. It is the piece that makes "worker in-process" and "worker as
+// its own service" interchangeable without touching a line of worker code.
+if (redisConfigured()) {
+  io.adapter(createAdapter(createConnection('socket-pub'), createConnection('socket-sub')));
+  logger.info('socket.io redis adapter enabled');
+}
+
 registerSocketAuth(io);
+
+// On a free tier a second always-on service is a second thing to keep awake,
+// so the worker can run inside the API process. docker-compose runs it as its
+// own container instead -- same module, same behaviour.
+if (redisConfigured() && process.env.RUN_WORKER_INLINE !== 'false') {
+  require('./queue/analysisWorker').startAnalysisWorker(io);
+}
 
 // ── Middleware
 app.use(helmet({
@@ -132,11 +152,17 @@ app.get('/readyz', async (req, res) => {
   }
 
   // Mongo is required to serve anything; the python service only gates
-  // analysis, so a cold one is reported but not treated as failure.
+  // analysis, so a cold one is reported but not treated as failure. Redis is
+  // optional by design -- without it analysis runs inline.
   const ready = mongoUp;
   res.status(ready ? 200 : 503).json({
     status: ready ? 'ready' : 'not ready',
-    checks: { mongo: mongoUp, pythonService: pythonUp }
+    checks: {
+      mongo: mongoUp,
+      pythonService: pythonUp,
+      redis: redisConfigured(),
+      analysisMode: analysisQueue.isEnabled() ? 'queued' : 'inline'
+    }
   });
 });
 
@@ -177,7 +203,20 @@ mongoose.connect(process.env.MONGO_URI)
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  logger.info({ port: PORT }, 'backend listening');
+  logger.info({
+    port: PORT,
+    analysisMode: analysisQueue.isEnabled() ? 'queued' : 'inline (no REDIS_URL)'
+  }, 'backend listening');
 });
+
+// Finish in-flight work instead of dropping it when the platform recycles us.
+const shutdown = async (signal) => {
+  logger.info({ signal }, 'shutting down');
+  server.close();
+  await analysisQueue.closeQueue().catch(() => {});
+  await mongoose.disconnect().catch(() => {});
+  process.exit(0);
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 module.exports = { app, server, io };

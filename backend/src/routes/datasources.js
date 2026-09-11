@@ -5,6 +5,7 @@ const auth = require('../middleware/auth');
 const { callPython } = require('../services/pythonService');
 const DataSource = require('../models/DataSource');
 const logger = require('../lib/logger');
+const { hashContent } = require('../services/analysisRunner');
 
 const router = express.Router();
 
@@ -109,7 +110,8 @@ async function handleFileUpload(req, res) {
         fileName: req.file.originalname,
         fileFormat,
         fileSize: req.file.size,
-        fileContent
+        fileContent,
+        fileHash: hashContent(fileContent)
       },
       columns: pythonData.columns,
       numericColumns: pythonData.numeric_columns || [],

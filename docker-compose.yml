@@ -19,9 +19,32 @@ services:
       - PYTHON_SERVICE_URL=http://python-service:8000
       - JWT_SECRET=${JWT_SECRET:?set JWT_SECRET in .env}
       - PORT=5000
+      # The worker runs as its own container below, so the API must not also
+      # host one -- otherwise both would consume the same queue.
+      - RUN_WORKER_INLINE=false
     depends_on:
       - mongo
       - redis
+      - python-service
+
+  # Same image and same code as the API; only the entrypoint differs. It holds
+  # no browser sockets of its own, so it publishes events through the socket.io
+  # Redis adapter and the API process delivers them. That indirection is what
+  # lets the free-tier deployment run this worker inside the API process
+  # instead, with no code change (RUN_WORKER_INLINE unset).
+  worker:
+    build: ./backend
+    command: ["npm", "run", "worker"]
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/anomalyiq
+      - REDIS_URL=redis://redis:6379
+      - PYTHON_SERVICE_URL=http://python-service:8000
+      - JWT_SECRET=${JWT_SECRET:?set JWT_SECRET in .env}
+      - ANALYSIS_CONCURRENCY=2
+    depends_on:
+      - mongo
+      - redis
+      - python-service
 
   python-service:
     build: ./python-service
@@ -43,6 +66,9 @@ services:
     image: redis:alpine
     ports:
       - "6379:6379"
+    # Jobs are cheap to re-run and Mongo holds the results, so persistence here
+    # buys little; losing the queue on restart is acceptable.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
 
 volumes:
   mongo_data:

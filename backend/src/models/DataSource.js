@@ -30,7 +30,11 @@ const dataSourceSchema = new mongoose.Schema({
     // fail with ENOENT for every source uploaded before the last restart.
     // select:false keeps it out of list queries — ask for it explicitly with
     // .select('+config.fileContent') when you actually need to parse the file.
-    fileContent: { type: String, select: false }
+    fileContent: { type: String, select: false },
+    // sha256 of fileContent. Analysis job ids are derived from it, so an
+    // identical re-run collapses onto the existing job instead of queueing a
+    // duplicate, and changing the file necessarily produces a new job.
+    fileHash: String
   },
   columns: [String],       // detected columns from the data
   numericColumns: [String],

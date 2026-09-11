@@ -15,30 +15,65 @@ AnomalyIQ is a full-stack platform that detects statistical anomalies in any tab
 - Choose which columns to monitor and tune the detection threshold
 - Classifies each anomaly as High / Medium / Low severity
 - Generates plain-English explanations using Gemini AI
-- Pushes anomalies to your dashboard in real time via WebSockets — no refresh needed
+- Runs analysis as a background job with retries, and streams progress live over WebSockets
 - Full authentication with JWT
 
 ---
 
 ## Architecture
 ```
-┌─────────────────────────────────────────┐
-│           React + Redux Frontend         │
-│   Login / Data Sources / Anomaly UI     │
-└──────────────────┬──────────────────────┘
-                   │ REST + WebSocket
-┌──────────────────▼──────────────────────┐
-│         Node.js / Express Backend        │
-│   Auth, Data Sources, Job Queue,         │
-│   Socket.io, MongoDB                     │
-└──────────┬──────────────────────────────┘
-           │ HTTP
-┌──────────▼──────────────────────────────┐
-│       Python / FastAPI Service           │
-│   Z-score, IQR Detection, Gemini AI     │
-│   pandas, numpy, scipy                  │
-└─────────────────────────────────────────┘
+          ┌──────────────────────────────────────┐
+          │        React + Redux Frontend        │
+          │  Login / Sources / Anomalies / Jobs  │
+          └───────────────┬──────────────────────┘
+                REST + WebSocket (per-user rooms)
+          ┌───────────────▼──────────────────────┐
+          │        Node.js / Express API         │
+          │  Auth, uploads, job orchestration    │
+          └────┬─────────────────────────┬───────┘
+       enqueue │                         │ Socket.io
+          ┌────▼──────┐             ┌────▼───────┐
+          │   Redis   │◄────────────┤  MongoDB   │
+          │ BullMQ +  │   results   │ users,     │
+          │ socket    │             │ sources,   │
+          │ adapter   │             │ anomalies, │
+          └────┬──────┘             │ runs       │
+       consume │                    └────────────┘
+          ┌────▼─────────────────────────────────┐
+          │         Analysis Worker              │
+          │  (own container, or in-process)      │
+          └───────────────┬──────────────────────┘
+                          │ HTTP (X-Request-Id)
+          ┌───────────────▼──────────────────────┐
+          │       Python / FastAPI Service       │
+          │  4 detectors + batched Gemini calls  │
+          └──────────────────────────────────────┘
 ```
+
+### Analysis is a job, not a request
+
+`POST /api/anomalies/analyze/:id` returns **202 + a jobId** and a worker does the
+work; progress streams back over Socket.io. It used to block the request for up
+to 90 seconds, which on a cold free-tier python service looks exactly like a
+frozen browser.
+
+- **Idempotent.** The job id is derived from the source id, a SHA-256 of the
+  file, and the analysis options, so double-clicking "Run Analysis" joins the
+  existing job instead of starting a rival one.
+- **Retried.** Three attempts with exponential backoff; failures are kept for
+  24 hours, successes for one.
+- **Observable.** Every run is persisted as an `AnalysisRun`, so a dropped
+  websocket or a closed tab does not make a run unobservable —
+  `GET /api/anomalies/runs/:jobId` is the poll fallback.
+- **Optional.** With no `REDIS_URL` the same runner executes inline in the
+  request and emits the same events. The app is fully functional without Redis,
+  so a lapsed free-tier add-on degrades latency rather than causing an outage.
+
+The worker runs either as its own container (docker-compose, the real topology)
+or inside the API process via `RUN_WORKER_INLINE` (free-tier hosting, where a
+second always-on service is a second thing to keep awake). The same module runs
+in both; the socket.io Redis adapter is what lets a separate worker process
+reach browser connections held by the API.
 
 ---
 
@@ -47,7 +82,7 @@ AnomalyIQ is a full-stack platform that detects statistical anomalies in any tab
 | Layer | Technology |
 |---|---|
 | Frontend | React, Redux, React Router, Socket.io-client |
-| Backend | Node.js, Express.js, Socket.io, BullMQ |
+| Backend | Node.js, Express.js, Socket.io, BullMQ, Redis |
 | Detection | Python, FastAPI, pandas, numpy, statsmodels, scikit-learn |
 | AI | Google Gemini API (REST) |
 | Database | MongoDB + Mongoose |
@@ -175,8 +210,11 @@ anomalyiq/
 ├── backend/           # Node.js + Express
 │   └── src/
 │       ├── routes/    # auth, datasources, anomalies
-│       ├── models/    # User, DataSource, Anomaly
-│       └── middleware/ # JWT auth
+│       ├── models/    # User, DataSource, Anomaly, AnalysisRun
+│       ├── queue/     # BullMQ queue, worker, redis connection
+│       ├── services/  # analysisRunner (shared by worker and inline path)
+│       ├── lib/       # logger, token, indexes
+│       └── middleware/ # JWT auth, validation
 ├── python-service/    # FastAPI
 │   ├── app.py         # HTTP layer only
 │   ├── detection.py   # the four detectors (pure functions, no FastAPI)

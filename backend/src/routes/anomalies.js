@@ -1,10 +1,14 @@
 const express = require('express');
 const auth = require('../middleware/auth');
-const { callPython } = require('../services/pythonService');
 const { emitToUser } = require('../socket');
 const { pagination } = require('../middleware/validate');
 const logger = require('../lib/logger');
+const analysisQueue = require('../queue/analysisQueue');
+const {
+  runAnalysis, loadAnalysableSource, buildJobId, hashContent, markRunFailed
+} = require('../services/analysisRunner');
 const Anomaly = require('../models/Anomaly');
+const AnalysisRun = require('../models/AnalysisRun');
 const DataSource = require('../models/DataSource');
 
 module.exports = (io) => {
@@ -46,115 +50,181 @@ module.exports = (io) => {
     }
   });
 
-  // POST trigger analysis on a data source
+  // POST trigger analysis on a data source.
+  //
+  // Returns 202 + jobId when a queue is available, or 200 with the full result
+  // when it is not. Either way the response carries a jobId and a status, so
+  // the client follows one code path regardless of the server's mode.
   router.post('/analyze/:sourceId', auth, async (req, res) => {
+    const sourceId = req.params.sourceId;
+    let jobId;
+
     try {
-      const source = await DataSource.findOne({
-        _id: req.params.sourceId,
-        userId: req.user.id
-      }).select('+config.fileContent');
-
-      if (!source) {
-        return res.status(404).json({ message: 'Data source not found' });
-      }
-
-      const isFileSource = source.type === 'csv' || source.type === 'excel';
-      if (!isFileSource) {
-        return res.status(400).json({
-          message: `Analysis is not supported for ${source.type} sources yet`
-        });
-      }
-
-      // Sources uploaded before file contents were stored in Mongo only have a
-      // filePath pointing at a disk that no longer exists.
-      if (!source.config.fileContent) {
-        return res.status(400).json({
-          message: 'This data source was uploaded before file storage was fixed, ' +
-                   'so its file is no longer available. Please delete it and re-upload the file.'
-        });
-      }
-
-      // Analysis options come from the request body so the UI can drive them.
-      // Anything omitted is left undefined rather than defaulted here, so the
-      // python service owns the defaults in one place.
-      //
-      // Note this used to send `columns: source.columns` -- every column in
-      // the file. The python service ignored it, so it was harmless; now that
-      // column selection actually works, sending all of them would silently
-      // widen every analysis.
       const { columns, methods, zThreshold, window: win, stlPeriod } = req.body || {};
-
-      const pythonData = await callPython('/analyze', {
-        source_id: source._id.toString(),
-        type: source.type,
-        config: {
-          fileName: source.config.fileName,
-          name: source.name
-        },
-        file_content: source.config.fileContent,
-        file_format: source.config.fileFormat || 'csv',
-        encoding: 'base64',
-        columns: Array.isArray(columns) && columns.length ? columns : undefined,
-        methods: Array.isArray(methods) && methods.length ? methods : undefined,
-        z_threshold: typeof zThreshold === 'number' ? zThreshold : undefined,
+      const options = {
+        columns: Array.isArray(columns) ? columns : undefined,
+        methods: Array.isArray(methods) ? methods : undefined,
+        zThreshold: typeof zThreshold === 'number' ? zThreshold : undefined,
         window: typeof win === 'number' ? win : undefined,
-        stl_period: typeof stlPeriod === 'number' ? stlPeriod : undefined
-      }, { requestId: req.id });
+        stlPeriod: typeof stlPeriod === 'number' ? stlPeriod : undefined
+      };
 
-      const detectedAnomalies = pythonData.anomalies || [];
+      // Validate before queueing. Someone who picked a deleted source should
+      // be told now, not after waiting on a worker.
+      const source = await loadAnalysableSource(req.user.id, sourceId);
 
-      if (detectedAnomalies.length === 0) {
-        return res.json({ message: 'No anomalies detected', anomalies: [] });
+      // Hash the stored file so identical re-runs collapse onto one job.
+      // Backfilled for sources uploaded before the field existed.
+      let fileHash = source.config.fileHash;
+      if (!fileHash) {
+        fileHash = hashContent(source.config.fileContent);
+        await DataSource.updateOne({ _id: source._id }, { 'config.fileHash': fileHash });
       }
 
-      // Re-running analysis on unchanged data used to append a fresh duplicate
-      // set every time. Replace the previous run instead.
-      await Anomaly.deleteMany({ userId: req.user.id, dataSourceId: source._id });
+      jobId = buildJobId(sourceId, fileHash, options);
+      const queued = analysisQueue.isEnabled();
 
-      const savedAnomalies = await Anomaly.insertMany(
-        detectedAnomalies.map((a) => ({
+      // An in-flight run over exactly this data with exactly these options is
+      // the job we already have; a second click should join it, not race it.
+      const existing = await AnalysisRun.findOne({ jobId });
+      if (existing && ['queued', 'running'].includes(existing.status)) {
+        return res.status(202).json({
+          ...existing.toStatus(),
+          message: 'This analysis is already running.',
+          deduplicated: true
+        });
+      }
+
+      // Two simultaneous clicks can both pass the check above and race this
+      // upsert; the unique index on jobId turns the loser into an E11000.
+      // That collision means the other request already created the run, which
+      // is exactly the outcome we wanted, so treat it as success.
+      await AnalysisRun.findOneAndUpdate(
+        { jobId },
+        {
           userId: req.user.id,
           dataSourceId: source._id,
-          column: a.column,
-          rowIndex: a.row_index,
-          timestamp: a.timestamp,
-          value: a.value,
-          expectedMin: a.expected_min,
-          expectedMax: a.expected_max,
-          zScore: a.z_score,
-          method: a.method,
-          severity: a.severity,
-          explanation: a.explanation,
-          suggestion: a.suggestion
-        }))
-      );
+          jobId,
+          status: 'queued',
+          progress: 0,
+          stage: 'queued',
+          mode: queued ? 'queued' : 'inline',
+          options: {
+            columns: options.columns || [],
+            methods: options.methods || [],
+            zThreshold: options.zThreshold
+          },
+          error: null,
+          attempts: 0,
+          requestId: req.id,
+          startedAt: null,
+          finishedAt: null
+        },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      ).catch((err) => {
+        if (err.code !== 11000) throw err;
+      });
 
-      // Notify this user's other open tabs -- and only this user's. The caller
-      // gets the full list in the HTTP response and dedupes by _id, so this
-      // cannot double-count.
-      for (const saved of savedAnomalies) {
-        emitToUser(io, req.user.id, 'new_anomaly', { anomaly: saved, sourceName: source.name });
+      // -- Queued path
+      if (queued) {
+        await analysisQueue.enqueueAnalysis(jobId, {
+          userId: req.user.id, sourceId, options, requestId: req.id
+        });
+        emitToUser(io, req.user.id, 'analysis:queued', {
+          jobId, sourceId, status: 'queued', progress: 0
+        });
+        logger.info({ jobId, sourceId, requestId: req.id }, 'analysis queued');
+        return res.status(202).json({
+          jobId,
+          status: 'queued',
+          mode: 'queued',
+          sourceId,
+          message: 'Analysis queued.'
+        });
       }
 
-      logger.info(
-        { sourceId: source._id.toString(), count: savedAnomalies.length },
-        'analysis complete'
-      );
+      // -- Inline fallback: no Redis, so do the work inside the request. Same
+      // runner, same events, same persisted AnalysisRun; only the timing
+      // differs, which is what stops this path from rotting unnoticed.
+      const result = await runAnalysis({
+        userId: req.user.id,
+        sourceId,
+        options: Object.assign({}, options, { jobId }),
+        requestId: req.id,
+        onProgress: (progress, stage) => {
+          emitToUser(io, req.user.id, 'analysis:progress', {
+            jobId, sourceId, status: 'running', progress, stage
+          });
+        }
+      });
 
-      res.json({
-        message: `Found ${savedAnomalies.length} anomalies`,
-        anomalies: savedAnomalies,
-        truncated: Boolean(pythonData.truncated),
-        columnsAnalyzed: pythonData.columns_analyzed || [],
-        // So the UI can offer the columns this run did not cover.
-        numericColumns: pythonData.numeric_columns || [],
-        methodsUsed: pythonData.methods_used || []
+      for (const saved of result.anomalies) {
+        emitToUser(io, req.user.id, 'new_anomaly', {
+          anomaly: saved, sourceName: result.sourceName
+        });
+      }
+      emitToUser(io, req.user.id, 'analysis:completed', {
+        jobId,
+        sourceId,
+        status: 'succeeded',
+        progress: 100,
+        anomalyCount: result.anomalyCount,
+        truncated: result.truncated,
+        columnsAnalyzed: result.columnsAnalyzed,
+        numericColumns: result.numericColumns,
+        methodsUsed: result.methodsUsed
+      });
+
+      return res.json({
+        jobId,
+        status: 'succeeded',
+        mode: 'inline',
+        sourceId,
+        message: result.anomalyCount
+          ? 'Found ' + result.anomalyCount + ' anomalies'
+          : 'No anomalies detected',
+        anomalies: result.anomalies,
+        anomalyCount: result.anomalyCount,
+        truncated: result.truncated,
+        columnsAnalyzed: result.columnsAnalyzed,
+        numericColumns: result.numericColumns,
+        methodsUsed: result.methodsUsed
       });
     } catch (error) {
+      await markRunFailed(jobId, error);
       if (!error.status || error.status >= 500) {
-        logger.error({ err: error, sourceId: req.params.sourceId }, 'analysis failed');
+        logger.error({ err: error, sourceId, jobId }, 'analysis failed');
       }
       res.status(error.status || 500).json({ message: error.message || 'Server error' });
+    }
+  });
+
+  // GET the status of one run.
+  // The poll fallback for when the websocket is unavailable or dropped: a
+  // closed tab must not make a run unobservable.
+  router.get('/runs/:jobId', auth, async (req, res) => {
+    try {
+      const run = await AnalysisRun.findOne({ jobId: req.params.jobId, userId: req.user.id });
+      if (!run) {
+        return res.status(404).json({ message: 'Analysis run not found' });
+      }
+      res.json(run.toStatus());
+    } catch (error) {
+      logger.error({ err: error, jobId: req.params.jobId }, 'fetch run failed');
+      res.status(500).json({ message: 'Server error' });
+    }
+  });
+
+  // GET recent runs for a data source.
+  router.get('/runs/source/:sourceId', auth, async (req, res) => {
+    try {
+      const runs = await AnalysisRun.find({
+        userId: req.user.id, dataSourceId: req.params.sourceId
+      }).sort({ createdAt: -1 }).limit(10);
+      res.json({ items: runs.map((r) => r.toStatus()) });
+    } catch (error) {
+      logger.error({ err: error }, 'list runs failed');
+      res.status(500).json({ message: 'Server error' });
     }
   });
 
