@@ -27,6 +27,19 @@ const authSlice = createSlice({
       state.loading = false;
       state.error = action.payload;
     },
+    // Restores the signed-in user after a page refresh. Only the token was
+    // persisted, so `user` came back null and the interface had no name to
+    // show -- even though the session was perfectly valid.
+    sessionRestored: (state, action) => {
+      state.user = action.payload;
+      state.isAuthenticated = true;
+    },
+    sessionExpired: (state) => {
+      state.user = null;
+      state.token = null;
+      state.isAuthenticated = false;
+      localStorage.removeItem('token');
+    },
     logout: (state) => {
       state.user = null;
       state.token = null;
@@ -36,5 +49,7 @@ const authSlice = createSlice({
   }
 });
 
-export const { loginStart, loginSuccess, loginFailure, logout } = authSlice.actions;
+export const {
+  loginStart, loginSuccess, loginFailure, logout, sessionRestored, sessionExpired
+} = authSlice.actions;
 export default authSlice.reducer;

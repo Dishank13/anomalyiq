@@ -1,397 +1,471 @@
-import React, { useEffect, useState } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { useDispatch, useSelector } from 'react-redux';
-import { logout } from '../store/slices/authSlice';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useParams } from 'react-router-dom';
 import api from '../services/api';
 import socket from '../services/socket';
+import AnalysisConfig from '../components/AnalysisConfig';
+import AnomalyChart, { compact, full } from '../components/AnomalyChart';
+import {
+  AppShell, Crosshair, EmptyState, Field, ProgressBar, SeverityBadge,
+  Skeleton, useToast
+} from '../components/ui';
 
-function AnomalyDetail() {
+const SEVERITY_ORDER = { high: 0, medium: 1, low: 2 };
+
+const METHOD_LABEL = {
+  zscore: 'Z-score (rolling)',
+  iqr: 'IQR',
+  stl: 'Seasonal (STL)',
+  isolation_forest: 'Multivariate'
+};
+
+export default function AnomalyDetail() {
   const { id } = useParams();
-  const navigate = useNavigate();
-  const dispatch = useDispatch();
-  const { user } = useSelector((state) => state.auth);
+  const toast = useToast();
 
   const [source, setSource] = useState(null);
   const [anomalies, setAnomalies] = useState([]);
+  const [rows, setRows] = useState([]);
+  const [numericColumns, setNumericColumns] = useState([]);
+  const [plotColumn, setPlotColumn] = useState(null);
+
   const [loading, setLoading] = useState(true);
+  const [loadingSeries, setLoadingSeries] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
+  const [job, setJob] = useState(null);
   const [filter, setFilter] = useState('all');
   const [selected, setSelected] = useState(null);
-  const [notice, setNotice] = useState(null);
-  const [job, setJob] = useState(null);        // { jobId, status, progress, stage }
+  const [showConfig, setShowConfig] = useState(false);
+  const [waking, setWaking] = useState(false);
+  const [config, setConfig] = useState({ columns: [], methods: [], zThreshold: 3 });
 
+  /* ── initial load */
   useEffect(() => {
-    const fetchData = async () => {
+    let cancelled = false;
+    (async () => {
       try {
-        // Fetch just this source rather than pulling the whole list and
-        // filtering client-side.
-        const [sourceRes, anomaliesRes] = await Promise.all([
+        const [srcRes, anomRes] = await Promise.all([
           api.get(`/api/datasources/${id}`),
-          api.get(`/api/anomalies/source/${id}`)
+          api.get(`/api/anomalies/source/${id}?limit=500`)
         ]);
-        setSource(sourceRes.data);
-        // The list endpoints are paginated now: { items, total, page, limit }.
-        setAnomalies(anomaliesRes.data.items || []);
+        if (cancelled) return;
+        setSource(srcRes.data);
+        setAnomalies(anomRes.data.items || []);
+        setNumericColumns(srcRes.data.numericColumns || []);
       } catch (err) {
-        setNotice(err.response?.data?.message || 'Could not load this data source.');
+        if (!cancelled) toast(err.response?.data?.message || 'Could not load this data source.', 'error');
       } finally {
-        setLoading(false);
+        if (!cancelled) setLoading(false);
       }
-    };
-    fetchData();
+    })();
+    return () => { cancelled = true; };
+  }, [id, toast]);
+
+  /* ── the series behind the chart.
+        Fetched separately: it is the largest payload on the page, and the
+        findings are useful before it arrives. */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoadingSeries(true);
+      // The python service may be cold. Say so rather than appearing to hang.
+      const wakeTimer = setTimeout(() => { if (!cancelled) setWaking(true); }, 4000);
+      try {
+        const { data } = await api.get(`/api/datasources/${id}/data`);
+        if (!cancelled) setRows(data.rows || []);
+      } catch (err) {
+        if (!cancelled) toast('Could not load the series behind the chart.', 'error');
+      } finally {
+        clearTimeout(wakeTimer);
+        if (!cancelled) { setLoadingSeries(false); setWaking(false); }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [id, toast]);
+
+  /* ── live job lifecycle */
+  const refreshAnomalies = useCallback(async () => {
+    const res = await api.get(`/api/anomalies/source/${id}?limit=500`);
+    setAnomalies(res.data.items || []);
   }, [id]);
+
   useEffect(() => {
     socket.connect();
+    const mine = (d) => !d.sourceId || String(d.sourceId) === String(id);
 
-    // The server now rejects unauthenticated handshakes, so a stale or expired
-    // token surfaces here instead of silently never delivering events.
-    const handleConnectError = (err) => {
+    const onConnectError = (err) => {
       if (/unauthorized/i.test(err.message)) {
-        setNotice('Live updates are unavailable — your session may have expired. Sign in again.');
+        toast('Live updates unavailable — your session may have expired.', 'error');
       }
     };
-    socket.on('connect_error', handleConnectError);
-
-    const handleNewAnomaly = (data) => {
-      if (String(data.anomaly.dataSourceId) !== String(id)) return;
-      // The client that triggered the analysis also receives this broadcast,
-      // and already has these rows from the HTTP response. Drop anything we
-      // are already showing instead of listing it twice.
-      setAnomalies((prev) =>
-        prev.some((a) => a._id === data.anomaly._id) ? prev : [data.anomaly, ...prev]
-      );
+    const onProgress = (d) => {
+      if (!mine(d)) return;
+      setJob({ status: d.status || 'running', progress: d.progress || 0, stage: d.stage });
     };
-
-    // Analysis is a job now, so its lifecycle arrives as events rather than as
-    // one blocking HTTP response.
-    const forThisSource = (d) => !d.sourceId || String(d.sourceId) === String(id);
-
-    const handleProgress = (d) => {
-      if (!forThisSource(d)) return;
-      setJob({ jobId: d.jobId, status: d.status || 'running',
-               progress: d.progress != null ? d.progress : 0, stage: d.stage });
-    };
-
-    const handleCompleted = async (d) => {
-      if (!forThisSource(d)) return;
-      setJob({ jobId: d.jobId, status: 'succeeded', progress: 100 });
+    const onCompleted = async (d) => {
+      if (!mine(d)) return;
+      setJob(null);
       setAnalyzing(false);
-      // The queued path never sent the rows over HTTP, so read them back.
-      try {
-        const res = await api.get('/api/anomalies/source/' + id);
-        setAnomalies(res.data.items || []);
-      } catch (err) { /* the notice below still reports what happened */ }
-      setNotice(
-        d.anomalyCount
-          ? 'Analysis complete - found ' + d.anomalyCount + ' anomal' +
-            (d.anomalyCount === 1 ? 'y' : 'ies') + '.' +
-            (d.truncated ? ' Showing the most significant results only.' : '')
-          : 'Analysis complete - no anomalies detected.'
-      );
+      await refreshAnomalies().catch(() => {});
+      if (d.numericColumns && d.numericColumns.length) setNumericColumns(d.numericColumns);
+      toast(d.anomalyCount
+        ? `Analysis complete — ${d.anomalyCount} finding${d.anomalyCount === 1 ? '' : 's'}.`
+        : 'Analysis complete — nothing out of range.');
     };
-
-    const handleFailed = (d) => {
-      if (!forThisSource(d)) return;
-      setJob({ jobId: d.jobId, status: 'failed', progress: 0 });
+    const onFailed = (d) => {
+      if (!mine(d)) return;
+      setJob(null);
       setAnalyzing(false);
-      setNotice(d.error || 'Analysis failed. Please try again.');
+      toast(d.error || 'Analysis failed.', 'error');
     };
 
-    socket.on('new_anomaly', handleNewAnomaly);
-    socket.on('analysis:queued', handleProgress);
-    socket.on('analysis:running', handleProgress);
-    socket.on('analysis:progress', handleProgress);
-    socket.on('analysis:completed', handleCompleted);
-    socket.on('analysis:failed', handleFailed);
+    socket.on('connect_error', onConnectError);
+    socket.on('analysis:queued', onProgress);
+    socket.on('analysis:running', onProgress);
+    socket.on('analysis:progress', onProgress);
+    socket.on('analysis:completed', onCompleted);
+    socket.on('analysis:failed', onFailed);
 
     return () => {
-      socket.off('new_anomaly', handleNewAnomaly);
-      socket.off('analysis:queued', handleProgress);
-      socket.off('analysis:running', handleProgress);
-      socket.off('analysis:progress', handleProgress);
-      socket.off('analysis:completed', handleCompleted);
-      socket.off('analysis:failed', handleFailed);
-      socket.off('connect_error', handleConnectError);
+      socket.off('connect_error', onConnectError);
+      socket.off('analysis:queued', onProgress);
+      socket.off('analysis:running', onProgress);
+      socket.off('analysis:progress', onProgress);
+      socket.off('analysis:completed', onCompleted);
+      socket.off('analysis:failed', onFailed);
       socket.disconnect();
     };
-  }, [id]);
+  }, [id, toast, refreshAnomalies]);
 
-  // Poll fallback for when socket events do not arrive -- a dropped connection
-  // or a blocked websocket must not leave a running job looking stuck forever.
-  const pollRun = async (jobId) => {
+  /* ── run */
+  const pollRun = useCallback(async (jobId) => {
     for (let i = 0; i < 60; i++) {
       await new Promise((r) => setTimeout(r, 2000));
       try {
-        const { data } = await api.get('/api/anomalies/runs/' + encodeURIComponent(jobId));
-        setJob({ jobId, status: data.status, progress: data.progress, stage: data.stage });
+        const { data } = await api.get(`/api/anomalies/runs/${encodeURIComponent(jobId)}`);
+        setJob({ status: data.status, progress: data.progress, stage: data.stage });
         if (data.status === 'succeeded') {
-          const res = await api.get('/api/anomalies/source/' + id);
-          setAnomalies(res.data.items || []);
-          setAnalyzing(false);
-          setNotice(data.anomalyCount
-            ? 'Analysis complete - found ' + data.anomalyCount + ' anomalies.'
-            : 'Analysis complete - no anomalies detected.');
+          setJob(null); setAnalyzing(false);
+          await refreshAnomalies();
+          toast(`Analysis complete — ${data.anomalyCount || 0} findings.`);
           return;
         }
         if (data.status === 'failed') {
-          setAnalyzing(false);
-          setNotice(data.error || 'Analysis failed. Please try again.');
+          setJob(null); setAnalyzing(false);
+          toast(data.error || 'Analysis failed.', 'error');
           return;
         }
       } catch (err) {
-        return;   // the run is gone or unreadable; stop polling
-      }
-    }
-  };
-
-  const handleAnalyze = async () => {
-    setAnalyzing(true);
-    setSelected(null);
-    setNotice(null);
-    setJob(null);
-    try {
-      const res = await api.post('/api/anomalies/analyze/' + id, {});
-
-      // Inline mode did the work inside the request and returned the rows.
-      if (res.data.mode === 'inline') {
-        const found = res.data.anomalies || [];
-        setAnomalies(found);
-        setNotice(
-          found.length === 0
-            ? 'Analysis complete - no anomalies detected.'
-            : 'Analysis complete - found ' + found.length + ' anomal' +
-              (found.length === 1 ? 'y' : 'ies') + '.' +
-              (res.data.truncated ? ' Showing the most significant results only.' : '')
-        );
-        setAnalyzing(false);
         return;
       }
+    }
+  }, [refreshAnomalies, toast]);
 
-      // Queued: the response is a receipt. Progress arrives over the socket,
-      // and the poll is there in case it does not.
-      setJob({ jobId: res.data.jobId, status: res.data.status || 'queued', progress: 0 });
-      setNotice(res.data.deduplicated
-        ? 'This analysis is already running - following the existing job.'
-        : 'Analysis queued...');
+  const runAnalysis = async () => {
+    setAnalyzing(true);
+    setSelected(null);
+    setShowConfig(false);
+    setJob({ status: 'queued', progress: 0, stage: 'queued' });
+    try {
+      const body = {};
+      if (config.columns.length) body.columns = config.columns;
+      if (config.methods.length) body.methods = config.methods;
+      if (config.zThreshold !== 3) body.zThreshold = config.zThreshold;
+
+      const res = await api.post(`/api/anomalies/analyze/${id}`, body);
+
+      if (res.data.mode === 'inline') {
+        setAnomalies(res.data.anomalies || []);
+        if (res.data.numericColumns && res.data.numericColumns.length) {
+          setNumericColumns(res.data.numericColumns);
+        }
+        setJob(null);
+        setAnalyzing(false);
+        toast(res.data.anomalyCount
+          ? `Analysis complete — ${res.data.anomalyCount} findings.`
+          : 'Analysis complete — nothing out of range.');
+        return;
+      }
+      toast(res.data.deduplicated ? 'Already running — following that job.' : 'Analysis queued.');
       pollRun(res.data.jobId);
     } catch (err) {
-      const msg = (err.response && err.response.data && err.response.data.message) ||
-                  'Analysis failed. Please try again.';
-      setNotice(msg);
+      setJob(null);
       setAnalyzing(false);
+      toast(err.response?.data?.message || 'Analysis failed.', 'error');
     }
   };
 
-  const handleLogout = () => {
-    dispatch(logout());
-    navigate('/login');
-  };
+  /* ── derived */
+  const counts = useMemo(() => {
+    const c = { all: anomalies.length, high: 0, medium: 0, low: 0 };
+    anomalies.forEach((a) => { c[a.severity] = (c[a.severity] || 0) + 1; });
+    return c;
+  }, [anomalies]);
 
-  const filtered = filter === 'all' ? anomalies : anomalies.filter(a => a.severity === filter);
+  const columnsWithFindings = useMemo(() => {
+    const seen = new Map();
+    anomalies.forEach((a) => seen.set(a.column, (seen.get(a.column) || 0) + 1));
+    return [...seen.entries()].sort((a, b) => b[1] - a[1]);
+  }, [anomalies]);
 
-  const severityColor = (s) => {
-    if (s === 'high') return '#ef4444';
-    if (s === 'medium') return '#f59e0b';
-    return '#3b82f6';
-  };
+  // Plot whichever column has the most findings first -- the one worth looking at.
+  useEffect(() => {
+    if (!plotColumn && columnsWithFindings.length) setPlotColumn(columnsWithFindings[0][0]);
+  }, [columnsWithFindings, plotColumn]);
 
-  const severityBg = (s) => {
-    if (s === 'high') return '#450a0a';
-    if (s === 'medium') return '#451a03';
-    return '#0c1a3a';
-  };
+  const visible = useMemo(() => {
+    const list = filter === 'all' ? anomalies : anomalies.filter((a) => a.severity === filter);
+    return [...list].sort((a, b) =>
+      (SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]) ||
+      (Math.abs(b.zScore) - Math.abs(a.zScore)));
+  }, [anomalies, filter]);
 
-  if (loading) return <div style={{color:'#94a3b8', padding:'40px'}}>Loading...</div>;
+  const chartAnomalies = useMemo(
+    () => anomalies.filter((a) => a.column === plotColumn),
+    [anomalies, plotColumn]
+  );
+
+  const selectedAnomaly = useMemo(
+    () => anomalies.find((a) => a._id === selected) || null,
+    [anomalies, selected]
+  );
+
+  /* ── render */
+  if (loading) {
+    return (
+      <AppShell wide>
+        <Skeleton className="h-8 w-56" />
+        <Skeleton className="mt-6 h-[380px] w-full" />
+        <Skeleton className="mt-8 h-64 w-full" />
+      </AppShell>
+    );
+  }
 
   return (
-    <div style={styles.container}>
-      {/* Header */}
-      <div style={styles.header}>
-        <h1 style={styles.title}>AnomalyIQ</h1>
-        <div style={styles.headerRight}>
-          <span style={styles.userName}>{user?.name}</span>
-          <button style={styles.logoutBtn} onClick={handleLogout}>Logout</button>
+    <AppShell wide>
+      {/* ── source header */}
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <div className="eyebrow">Source</div>
+          <h1 className="mt-1 font-display text-3xl font-semibold tracking-tight text-ink">
+            {source?.name}
+          </h1>
+          <p className="mt-1 font-mono text-xs text-graphite">
+            {source?.rowCount?.toLocaleString()} rows · {source?.columns?.length} columns
+            {numericColumns.length ? ` · ${numericColumns.length} numeric` : ''}
+            {source?.config?.fileName ? ` · ${source.config.fileName}` : ''}
+          </p>
         </div>
-      </div>
-
-      {/* Nav */}
-      <div style={styles.nav}>
-        <button style={styles.navBtn} onClick={() => navigate('/dashboard')}>Dashboard</button>
-        <button style={styles.navBtn} onClick={() => navigate('/datasources')}>Data Sources</button>
-      </div>
-
-      {/* Content */}
-      <div style={styles.content}>
-        {/* Source Info */}
-        <div style={styles.sourceInfo}>
-          <div>
-            <h2 style={styles.sourceName}>{source?.name}</h2>
-            <p style={styles.sourceMeta}>{source?.rowCount} rows • {source?.columns?.length} columns • {source?.type?.toUpperCase()}</p>
-          </div>
-          <button style={styles.analyzeBtn} onClick={handleAnalyze} disabled={analyzing}>
-            {analyzing ? '🔍 Analyzing...' : '🔍 Run Analysis'}
+        <div className="flex items-center gap-2">
+          <button onClick={() => setShowConfig((v) => !v)} className="btn-ghost">Configure</button>
+          <button onClick={runAnalysis} disabled={analyzing} className="btn-primary">
+            {analyzing ? 'Running…' : 'Run analysis'}
           </button>
         </div>
+      </div>
 
-        {job && ['queued', 'running'].includes(job.status) && (
-          <div style={styles.progressWrap}>
-            <div style={styles.progressHead}>
-              <span>{job.stage || (job.status === 'queued' ? 'queued' : 'running')}</span>
-              <span style={styles.progressPct}>{job.progress || 0}%</span>
+      {showConfig && (
+        <div className="mt-5">
+          <AnalysisConfig
+            numericColumns={numericColumns}
+            columns={config.columns}
+            methods={config.methods}
+            zThreshold={config.zThreshold}
+            onChange={(patch) => setConfig((c) => ({ ...c, ...patch }))}
+            onRun={runAnalysis}
+            onClose={() => setShowConfig(false)}
+            running={analyzing}
+          />
+        </div>
+      )}
+
+      {job && (
+        <div className="mt-5">
+          <ProgressBar percent={job.progress} stage={job.stage || job.status} />
+        </div>
+      )}
+
+      {/* ── the chart */}
+      <section className="panel mt-6 overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-rule px-5 py-3">
+          <div className="flex items-baseline gap-3">
+            <span className="eyebrow">Series</span>
+            <span className="font-mono text-sm text-ink">{plotColumn || '—'}</span>
+          </div>
+          {columnsWithFindings.length > 1 && (
+            <div className="flex flex-wrap gap-1">
+              {columnsWithFindings.map(([c, n]) => (
+                <button
+                  key={c}
+                  onClick={() => { setPlotColumn(c); setSelected(null); }}
+                  className={`rounded border px-2 py-1 font-mono text-[11px] transition-colors
+                    ${c === plotColumn ? 'border-ink bg-ink text-paper'
+                                       : 'border-rule text-graphite hover:border-graphite hover:text-ink'}`}
+                >
+                  {c} <span className="tnum opacity-60">{n}</span>
+                </button>
+              ))}
             </div>
-            <div style={styles.progressTrack}>
-              <div style={{ ...styles.progressBar, width: (job.progress || 0) + '%' }} />
+          )}
+        </div>
+
+        <div className="px-2 py-4">
+          {loadingSeries ? (
+            <div className="px-3">
+              <Skeleton className="h-[340px] w-full" />
+              {waking && (
+                <p className="mt-3 text-center font-mono text-xs text-graphite">
+                  Waking the analysis service — the first request after idle takes about a minute.
+                </p>
+              )}
             </div>
+          ) : rows.length && plotColumn ? (
+            <AnomalyChart
+              rows={rows}
+              column={plotColumn}
+              anomalies={chartAnomalies}
+              selected={selectedAnomaly?.rowIndex}
+              onSelect={(rowIndex) => {
+                const hit = anomalies.find((a) => a.rowIndex === rowIndex && a.column === plotColumn);
+                setSelected(hit ? hit._id : null);
+              }}
+            />
+          ) : (
+            <EmptyState title="Nothing plotted yet">
+              Run an analysis to find out-of-range values. They appear marked on the series.
+            </EmptyState>
+          )}
+        </div>
+
+        {rows.length > 0 && (
+          <p className="border-t border-rule px-5 py-2 font-mono text-[11px] text-faint">
+            First {rows.length.toLocaleString()} rows. Select a marked point to see the range it broke.
+          </p>
+        )}
+      </section>
+
+      {/* ── findings */}
+      <section className="mt-8">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h2 className="font-display text-xl font-semibold text-ink">
+            Findings <span className="font-mono tnum text-base font-normal text-graphite">{counts.all}</span>
+          </h2>
+          <div className="flex gap-1" role="group" aria-label="Filter by severity">
+            {['all', 'high', 'medium', 'low'].map((s) => (
+              <button
+                key={s}
+                onClick={() => setFilter(s)}
+                aria-pressed={filter === s}
+                className={`inline-flex items-center gap-1.5 rounded border px-2.5 py-1
+                            font-mono text-xs capitalize transition-colors
+                  ${filter === s ? 'border-ink bg-ink text-paper'
+                                 : 'border-rule text-graphite hover:border-graphite hover:text-ink'}`}
+              >
+                {s !== 'all' && <Crosshair severity={s} size={9} />}
+                {s} <span className="tnum opacity-60">{counts[s] || 0}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {counts.all === 0 ? (
+          <div className="panel mt-4">
+            <EmptyState
+              title="No findings yet"
+              action={<button onClick={runAnalysis} className="btn-primary">Run analysis</button>}
+            >
+              Analysis looks for values that fall outside what the surrounding data predicts.
+            </EmptyState>
+          </div>
+        ) : (
+          <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1fr)_380px]">
+            <ul className="panel max-h-[560px] divide-y divide-rule overflow-y-auto">
+              {visible.map((a) => {
+                const on = a._id === selected;
+                return (
+                  <li key={a._id}>
+                    <button
+                      onClick={() => {
+                        setSelected(on ? null : a._id);
+                        if (!on && a.column !== plotColumn) setPlotColumn(a.column);
+                      }}
+                      className={`flex w-full items-baseline gap-4 px-4 py-3 text-left transition-colors
+                        ${on ? 'bg-sunk' : 'hover:bg-sunk/60'}`}
+                    >
+                      <SeverityBadge severity={a.severity} />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate font-mono text-xs text-graphite">{a.column}</span>
+                        <span className="mt-0.5 block font-mono tnum text-sm text-ink">{full(a.value)}</span>
+                      </span>
+                      <span className="shrink-0 text-right">
+                        <span className="block font-mono tnum text-sm text-ink">
+                          z {Math.abs(a.zScore).toFixed(2)}
+                        </span>
+                        <span className="mt-0.5 block font-mono text-[10px] uppercase tracking-wider text-faint">
+                          row {a.rowIndex}
+                        </span>
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+
+            <aside className="panel h-fit lg:sticky lg:top-20">
+              {selectedAnomaly ? (
+                <div className="animate-fade-up p-5">
+                  <div className="flex items-center justify-between">
+                    <SeverityBadge severity={selectedAnomaly.severity} />
+                    <span className="font-mono text-[11px] text-faint">row {selectedAnomaly.rowIndex}</span>
+                  </div>
+
+                  <div className="mt-4">
+                    <div className="eyebrow">{selectedAnomaly.column}</div>
+                    <div className="mt-1 font-mono tnum text-3xl text-ink">
+                      {compact(selectedAnomaly.value)}
+                    </div>
+                    <div className="mt-1 font-mono tnum text-xs text-graphite">
+                      {full(selectedAnomaly.value)}
+                    </div>
+                  </div>
+
+                  <div className="mt-4 divide-y divide-rule border-y border-rule">
+                    <Field label="Expected">
+                      {compact(selectedAnomaly.expectedMin)} – {compact(selectedAnomaly.expectedMax)}
+                    </Field>
+                    <Field label="Z-score">{selectedAnomaly.zScore?.toFixed(2)}</Field>
+                    <Field label="Method" mono={false}>
+                      <span className="font-sans text-sm">
+                        {METHOD_LABEL[selectedAnomaly.method] || selectedAnomaly.method}
+                      </span>
+                    </Field>
+                  </div>
+
+                  {selectedAnomaly.explanation && (
+                    <div className="mt-4">
+                      <div className="eyebrow">Explanation</div>
+                      <p className="mt-1.5 text-sm leading-relaxed text-ink">
+                        {selectedAnomaly.explanation}
+                      </p>
+                    </div>
+                  )}
+                  {selectedAnomaly.suggestion && (
+                    <div className="mt-4 rounded bg-sunk p-3">
+                      <div className="eyebrow">Investigate</div>
+                      <p className="mt-1.5 text-sm leading-relaxed text-ink">
+                        {selectedAnomaly.suggestion}
+                      </p>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <EmptyState title="Select a finding">
+                  Pick one from the list, or click a marked point on the series above.
+                </EmptyState>
+              )}
+            </aside>
           </div>
         )}
-
-        {notice && <div style={styles.notice}>{notice}</div>}
-
-        {/* Stats */}
-        <div style={styles.statsRow}>
-          {['all', 'high', 'medium', 'low'].map(s => (
-            <div
-              key={s}
-              style={{...styles.statCard, border: filter === s ? '1px solid #3b82f6' : '1px solid #334155', cursor: 'pointer'}}
-              onClick={() => setFilter(s)}
-            >
-              <p style={{...styles.statNumber, color: s === 'all' ? '#f1f5f9' : severityColor(s)}}>
-                {s === 'all' ? anomalies.length : anomalies.filter(a => a.severity === s).length}
-              </p>
-              <p style={styles.statLabel}>{s === 'all' ? 'Total' : s.charAt(0).toUpperCase() + s.slice(1)}</p>
-            </div>
-          ))}
-        </div>
-
-        {/* Anomalies List + Detail */}
-        <div style={styles.mainGrid}>
-          {/* List */}
-          <div style={styles.list}>
-            <h3 style={styles.listTitle}>
-              {filter === 'all' ? 'All Anomalies' : `${filter.charAt(0).toUpperCase() + filter.slice(1)} Severity`}
-              <span style={styles.listCount}>{filtered.length}</span>
-            </h3>
-            {filtered.length === 0 ? (
-              <p style={styles.empty}>No anomalies found. Run analysis to detect anomalies.</p>
-            ) : (
-              filtered.map((anomaly) => (
-                <div
-                  key={anomaly._id}
-                  style={{...styles.anomalyCard, border: selected?._id === anomaly._id ? '1px solid #3b82f6' : '1px solid #334155'}}
-                  onClick={() => setSelected(anomaly)}
-                >
-                  <div style={styles.anomalyTop}>
-                    <span style={{...styles.severityBadge, backgroundColor: severityBg(anomaly.severity), color: severityColor(anomaly.severity)}}>
-                      {anomaly.severity.toUpperCase()}
-                    </span>
-                    <span style={styles.anomalyMethod}>{anomaly.method.toUpperCase()}</span>
-                  </div>
-                  <p style={styles.anomalyColumn}>{anomaly.column}</p>
-                  <p style={styles.anomalyValue}>Value: <strong style={{color: severityColor(anomaly.severity)}}>{Number(anomaly.value).toLocaleString()}</strong></p>
-                  <p style={styles.anomalyRange}>Expected: {Number(anomaly.expectedMin).toLocaleString()} – {Number(anomaly.expectedMax).toLocaleString()}</p>
-                </div>
-              ))
-            )}
-          </div>
-
-          {/* Detail Panel */}
-          <div style={styles.detail}>
-            {selected ? (
-              <>
-                <h3 style={styles.detailTitle}>Anomaly Detail</h3>
-                <div style={{...styles.detailSeverity, backgroundColor: severityBg(selected.severity), borderColor: severityColor(selected.severity)}}>
-                  <span style={{color: severityColor(selected.severity), fontWeight: 'bold', fontSize: '18px'}}>
-                    {selected.severity.toUpperCase()} SEVERITY
-                  </span>
-                </div>
-                <div style={styles.detailSection}>
-                  <p style={styles.detailLabel}>Column</p>
-                  <p style={styles.detailValue}>{selected.column}</p>
-                </div>
-                <div style={styles.detailSection}>
-                  <p style={styles.detailLabel}>Anomalous Value</p>
-                  <p style={{...styles.detailValue, color: severityColor(selected.severity), fontSize: '24px'}}>
-                    {Number(selected.value).toLocaleString()}
-                  </p>
-                </div>
-                <div style={styles.detailSection}>
-                  <p style={styles.detailLabel}>Expected Range</p>
-                  <p style={styles.detailValue}>{Number(selected.expectedMin).toLocaleString()} – {Number(selected.expectedMax).toLocaleString()}</p>
-                </div>
-                <div style={styles.detailSection}>
-                  <p style={styles.detailLabel}>Z-Score</p>
-                  <p style={styles.detailValue}>{selected.zScore?.toFixed(2)}</p>
-                </div>
-                <div style={styles.detailSection}>
-                  <p style={styles.detailLabel}>Detection Method</p>
-                  <p style={styles.detailValue}>{selected.method === 'zscore' ? 'Z-Score (Rolling Window)' : 'IQR (Interquartile Range)'}</p>
-                </div>
-                <div style={styles.detailSection}>
-                  <p style={styles.detailLabel}>🤖 AI Explanation</p>
-                  <p style={styles.detailExplanation}>{selected.explanation}</p>
-                </div>
-                <div style={styles.detailSection}>
-                  <p style={styles.detailLabel}>💡 Suggestion</p>
-                  <p style={styles.detailExplanation}>{selected.suggestion}</p>
-                </div>
-              </>
-            ) : (
-              <div style={styles.detailEmpty}>
-                <p style={styles.detailEmptyText}>👆 Click an anomaly to see details</p>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
+      </section>
+    </AppShell>
   );
 }
-
-const styles = {
-  container: { minHeight: '100vh', backgroundColor: '#0f172a' },
-  header: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '20px 40px', backgroundColor: '#1e293b', borderBottom: '1px solid #334155' },
-  title: { color: '#3b82f6', margin: 0 },
-  headerRight: { display: 'flex', alignItems: 'center', gap: '16px' },
-  userName: { color: '#94a3b8' },
-  logoutBtn: { padding: '8px 16px', backgroundColor: '#ef4444', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer' },
-  nav: { display: 'flex', gap: '8px', padding: '16px 40px', backgroundColor: '#1e293b', borderBottom: '1px solid #334155' },
-  navBtn: { padding: '8px 16px', backgroundColor: 'transparent', color: '#94a3b8', border: '1px solid #334155', borderRadius: '8px', cursor: 'pointer' },
-  content: { padding: '40px' },
-  sourceInfo: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' },
-  sourceName: { color: '#f1f5f9', margin: '0 0 4px 0', fontSize: '24px' },
-  sourceMeta: { color: '#94a3b8', margin: 0 },
-  analyzeBtn: { padding: '12px 24px', backgroundColor: '#3b82f6', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '16px' },
-  notice: { backgroundColor: '#1e293b', border: '1px solid #334155', color: '#cbd5e1', padding: '12px 16px', borderRadius: '8px', marginBottom: '20px', fontSize: '14px' },
-  progressWrap: { backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '8px', padding: '12px 16px', marginBottom: '12px' },
-  progressHead: { display: 'flex', justifyContent: 'space-between', color: '#cbd5e1', fontSize: '13px', marginBottom: '8px', textTransform: 'capitalize' },
-  progressPct: { color: '#94a3b8' },
-  progressTrack: { height: '6px', backgroundColor: '#0f172a', borderRadius: '3px', overflow: 'hidden' },
-  progressBar: { height: '100%', backgroundColor: '#3b82f6', borderRadius: '3px', transition: 'width 240ms ease' },
-  statsRow: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '16px', marginBottom: '24px' },
-  statCard: { backgroundColor: '#1e293b', padding: '20px', borderRadius: '12px', textAlign: 'center' },
-  statNumber: { fontSize: '32px', fontWeight: 'bold', margin: '0 0 4px 0' },
-  statLabel: { color: '#94a3b8', margin: 0, fontSize: '14px' },
-  mainGrid: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' },
-  list: { backgroundColor: '#1e293b', borderRadius: '12px', padding: '24px', maxHeight: '600px', overflowY: 'auto' },
-  listTitle: { color: '#f1f5f9', marginTop: 0, display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
-  listCount: { backgroundColor: '#0f172a', color: '#94a3b8', padding: '2px 10px', borderRadius: '12px', fontSize: '14px' },
-  anomalyCard: { backgroundColor: '#0f172a', padding: '16px', borderRadius: '8px', marginBottom: '12px', cursor: 'pointer' },
-  anomalyTop: { display: 'flex', justifyContent: 'space-between', marginBottom: '8px' },
-  severityBadge: { padding: '2px 8px', borderRadius: '4px', fontSize: '11px', fontWeight: 'bold' },
-  anomalyMethod: { color: '#64748b', fontSize: '12px' },
-  anomalyColumn: { color: '#f1f5f9', fontWeight: 'bold', margin: '0 0 4px 0' },
-  anomalyValue: { color: '#94a3b8', fontSize: '14px', margin: '0 0 2px 0' },
-  anomalyRange: { color: '#64748b', fontSize: '12px', margin: 0 },
-  empty: { color: '#94a3b8', textAlign: 'center', padding: '40px 0' },
-  detail: { backgroundColor: '#1e293b', borderRadius: '12px', padding: '24px' },
-  detailTitle: { color: '#f1f5f9', marginTop: 0 },
-  detailSeverity: { padding: '16px', borderRadius: '8px', border: '1px solid', marginBottom: '20px', textAlign: 'center' },
-  detailSection: { marginBottom: '16px', paddingBottom: '16px', borderBottom: '1px solid #1e293b' },
-  detailLabel: { color: '#64748b', fontSize: '12px', margin: '0 0 4px 0', textTransform: 'uppercase', letterSpacing: '0.05em' },
-  detailValue: { color: '#f1f5f9', margin: 0, fontSize: '16px', fontWeight: 'bold' },
-  detailExplanation: { color: '#94a3b8', margin: 0, lineHeight: '1.6' },
-  detailEmpty: { display: 'flex', alignItems: 'center', justifyContent: 'center', height: '300px' },
-  detailEmptyText: { color: '#334155', fontSize: '18px' }
-};
-
-export default AnomalyDetail;

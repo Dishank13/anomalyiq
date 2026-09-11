@@ -110,10 +110,13 @@ async function runAnalysis({ userId, sourceId, options = {}, requestId, onProgre
   const detected = pythonData.anomalies || [];
   await emit(75, 'saving results');
 
-  // Re-running analysis on unchanged data used to append a fresh duplicate set
-  // every time. Replace the previous run instead.
-  await Anomaly.deleteMany({ userId, dataSourceId: source._id });
-
+  // Write the new findings BEFORE removing the old ones.
+  //
+  // The original order deleted first, which meant any failure in between --
+  // a validation error, a dropped connection -- left the source with no
+  // findings at all rather than the previous run's. Insert-then-prune is
+  // recoverable in both directions: a failed insert leaves the old results
+  // untouched, and a failed prune leaves duplicates that the next run clears.
   const saved = detected.length
     ? await Anomaly.insertMany(detected.map((a) => ({
         userId,
@@ -131,6 +134,14 @@ async function runAnalysis({ userId, sourceId, options = {}, requestId, onProgre
         suggestion: a.suggestion
       })))
     : [];
+
+  // Now that the new rows are safely stored, drop everything that is not part
+  // of this run. With no findings this correctly clears the source.
+  await Anomaly.deleteMany({
+    userId,
+    dataSourceId: source._id,
+    _id: { $nin: saved.map((d) => d._id) }
+  });
 
   const result = {
     sourceId: source._id.toString(),

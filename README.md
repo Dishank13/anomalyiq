@@ -16,6 +16,8 @@ AnomalyIQ is a full-stack platform that detects statistical anomalies in any tab
 - Classifies each anomaly as High / Medium / Low severity
 - Generates plain-English explanations using Gemini AI
 - Runs analysis as a background job with retries, and streams progress live over WebSockets
+- Plots the series with every finding marked, so you can see the outlier in context
+- Explains each finding in plain English, with the statistics behind the call
 - Full authentication with JWT
 
 ---
@@ -81,7 +83,7 @@ reach browser connections held by the API.
 
 | Layer | Technology |
 |---|---|
-| Frontend | React, Redux, React Router, Socket.io-client |
+| Frontend | React, Redux, React Router, Tailwind CSS, Recharts, Socket.io-client |
 | Backend | Node.js, Express.js, Socket.io, BullMQ, Redis |
 | Detection | Python, FastAPI, pandas, numpy, statsmodels, scikit-learn |
 | AI | Google Gemini API (REST) |
@@ -180,6 +182,31 @@ it produced identical output, verified row for row:
 | > 5.0 | High | < 0.00003% of normal data |
 | 3.5 - 5.0 | Medium | < 0.05% |
 | 3.0 - 3.5 | Low | < 0.3% |
+
+---
+
+## Interface
+
+The governing rule is that **colour encodes severity and nothing else**. Buttons,
+links, focus rings and chrome are all ink; in a tool whose job is to pull your eye
+to outliers, a coloured button competes with the signal.
+
+The three severity colours were validated for colour-vision deficiency rather than
+picked by eye — worst adjacent pair ΔE 18.6 (deutan), 22.1 (normal vision) against
+the page surface — and severity is never carried by colour alone: every finding also
+gets a crosshair glyph and a text label.
+
+**The control chart is the hero.** Findings are marked on the actual series with a
+ring-and-crosshair mark, borrowed from the statistical process control convention
+where an out-of-control point gets its own glyph. Selecting a finding reveals the
+exact range *that* point violated.
+
+There is deliberately no continuous "expected range" band: the rolling bounds are
+only known at the points the analysis actually tested, so drawing one everywhere
+would mean interpolating limits that were never computed.
+
+Every numeral is set in IBM Plex Mono with tabular figures, so a column of z-scores
+can be compared by scanning it.
 
 ---
 

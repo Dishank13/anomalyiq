@@ -1,0 +1,60 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-paper text-ink font-sans antialiased;
+  }
+
+  /* Numerals align in columns so a list of z-scores can be compared by eye. */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* One focus treatment everywhere, in ink rather than the browser blue. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ink ring-offset-2 ring-offset-paper;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  /* Instrument-panel label: small, monospaced, letterspaced caps. Used for
+     section headings and field labels so the interface reads as a set of
+     readings rather than a set of cards. */
+  .eyebrow {
+    @apply font-mono text-eyebrow uppercase text-graphite;
+  }
+
+  .rule-t { @apply border-t border-rule; }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded px-3.5 py-2
+           font-sans text-sm font-medium transition-colors
+           disabled:cursor-not-allowed disabled:opacity-40;
+  }
+  .btn-primary { @apply btn bg-ink text-paper hover:bg-ink/85 active:bg-ink; }
+  .btn-ghost {
+    @apply btn border border-rule bg-paper text-ink hover:border-graphite hover:bg-sunk;
+  }
+
+  .field {
+    @apply w-full rounded border border-rule bg-paper px-3 py-2 font-sans text-sm
+           text-ink placeholder:text-faint focus:border-ink focus:outline-none;
+  }
+
+  .panel { @apply rounded-lg border border-rule bg-paper shadow-panel; }
+}

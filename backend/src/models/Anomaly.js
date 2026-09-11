@@ -23,7 +23,10 @@ const anomalySchema = new mongoose.Schema({
   zScore: Number,
   method: {
     type: String,
-    enum: ['zscore', 'iqr'],
+    // Must track detection.ALL_METHODS in the python service. It did not:
+    // stl and isolation_forest shipped as detectors while this enum still
+    // allowed only two values, so choosing either failed validation on save.
+    enum: ['zscore', 'iqr', 'stl', 'isolation_forest'],
     required: true
   },
   severity: {

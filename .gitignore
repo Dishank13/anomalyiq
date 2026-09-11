@@ -14,3 +14,11 @@ python-service/log/
 
 # Local verification scratch files
 .verify_*.js
+
+# Local dev overrides (CRA convention) and editor tooling
+.env*.local
+.claude/
+
+# Local dev overrides (CRA convention) and editor tooling
+.env*.local
+.claude/

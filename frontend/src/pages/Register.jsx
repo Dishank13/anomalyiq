@@ -1,20 +1,19 @@
 import React, { useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
-import { useNavigate, Link } from 'react-router-dom';
-import { loginStart, loginSuccess, loginFailure } from '../store/slices/authSlice';
+import { Link, useNavigate } from 'react-router-dom';
+import { loginFailure, loginStart, loginSuccess } from '../store/slices/authSlice';
 import api from '../services/api';
+import AuthLayout from './AuthLayout';
 
-function Register() {
+export default function Register() {
   const dispatch = useDispatch();
   const navigate = useNavigate();
   const { loading, error } = useSelector((state) => state.auth);
   const [form, setForm] = useState({ name: '', email: '', password: '' });
 
-  const handleChange = (e) => {
-    setForm({ ...form, [e.target.name]: e.target.value });
-  };
+  const change = (e) => setForm({ ...form, [e.target.name]: e.target.value });
 
-  const handleSubmit = async (e) => {
+  const submit = async (e) => {
     e.preventDefault();
     dispatch(loginStart());
     try {
@@ -22,65 +21,64 @@ function Register() {
       dispatch(loginSuccess(res.data));
       navigate('/dashboard');
     } catch (err) {
-      dispatch(loginFailure(err.response?.data?.message || 'Registration failed'));
+      // The API returns per-field validation messages; show them rather than
+      // a generic failure.
+      const data = err.response?.data;
+      const detail = data?.errors?.map((e2) => e2.message).join(' · ');
+      dispatch(loginFailure(detail || data?.message || 'Could not create your account.'));
     }
   };
 
   return (
-    <div style={styles.container}>
-      <div style={styles.card}>
-        <h1 style={styles.title}>AnomalyIQ</h1>
-        <h2 style={styles.subtitle}>Create Account</h2>
-        {error && <p style={styles.error}>{error}</p>}
-        <form onSubmit={handleSubmit}>
+    <AuthLayout
+      title="Create an account"
+      subtitle="Upload a spreadsheet and see what does not belong in it."
+      footer={
+        <>
+          Already have one?{' '}
+          <Link to="/login" className="text-ink underline decoration-rule underline-offset-4 hover:decoration-ink">
+            Sign in
+          </Link>
+        </>
+      }
+    >
+      <form onSubmit={submit} className="space-y-4">
+        <label className="block">
+          <span className="eyebrow">Name</span>
           <input
-            style={styles.input}
-            type="text"
-            name="name"
-            placeholder="Full Name"
-            value={form.name}
-            onChange={handleChange}
-            required
+            className="field mt-1.5" name="name" autoComplete="name"
+            value={form.name} onChange={change} placeholder="Dishank Shah" required
           />
+        </label>
+
+        <label className="block">
+          <span className="eyebrow">Email</span>
           <input
-            style={styles.input}
-            type="email"
-            name="email"
-            placeholder="Email"
-            value={form.email}
-            onChange={handleChange}
-            required
+            className="field mt-1.5" type="email" name="email" autoComplete="email"
+            value={form.email} onChange={change} placeholder="you@example.com" required
           />
+        </label>
+
+        <label className="block">
+          <span className="eyebrow">Password</span>
           <input
-            style={styles.input}
-            type="password"
-            name="password"
-            placeholder="Password (min 6 characters)"
-            value={form.password}
-            onChange={handleChange}
-            required
+            className="field mt-1.5" type="password" name="password" autoComplete="new-password"
+            value={form.password} onChange={change} placeholder="At least 6 characters"
+            minLength={6} required
           />
-          <button style={styles.button} type="submit" disabled={loading}>
-            {loading ? 'Creating account...' : 'Create Account'}
-          </button>
-        </form>
-        <p style={styles.link}>
-          Already have an account? <Link to="/login">Sign In</Link>
-        </p>
-      </div>
-    </div>
+          <span className="mt-1 block font-mono text-[11px] text-faint">6 characters minimum</span>
+        </label>
+
+        {error && (
+          <p role="alert" className="rounded border border-high/30 bg-high/[0.06] px-3 py-2 text-sm text-high">
+            {error}
+          </p>
+        )}
+
+        <button type="submit" disabled={loading} className="btn-primary w-full">
+          {loading ? 'Creating account…' : 'Create account'}
+        </button>
+      </form>
+    </AuthLayout>
   );
 }
-
-const styles = {
-  container: { display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', backgroundColor: '#0f172a' },
-  card: { backgroundColor: '#1e293b', padding: '40px', borderRadius: '12px', width: '100%', maxWidth: '400px' },
-  title: { color: '#3b82f6', textAlign: 'center', marginBottom: '4px', fontSize: '28px' },
-  subtitle: { color: '#94a3b8', textAlign: 'center', marginBottom: '24px', fontSize: '16px', fontWeight: 'normal' },
-  input: { width: '100%', padding: '12px', marginBottom: '16px', borderRadius: '8px', border: '1px solid #334155', backgroundColor: '#0f172a', color: '#f1f5f9', fontSize: '14px', boxSizing: 'border-box' },
-  button: { width: '100%', padding: '12px', backgroundColor: '#3b82f6', color: 'white', border: 'none', borderRadius: '8px', fontSize: '16px', cursor: 'pointer' },
-  error: { color: '#ef4444', marginBottom: '16px', textAlign: 'center' },
-  link: { color: '#94a3b8', textAlign: 'center', marginTop: '16px' }
-};
-
-export default Register;
