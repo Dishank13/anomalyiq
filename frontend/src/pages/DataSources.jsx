@@ -5,6 +5,7 @@ import {
   addSource, fetchSourcesFailure, fetchSourcesStart, fetchSourcesSuccess, removeSource
 } from '../store/slices/dataSlice';
 import api from '../services/api';
+import warmAnalysisService from '../services/warm';
 import { AppShell, EmptyState, Skeleton, useToast } from '../components/ui';
 
 const ACCEPTED = ['.csv', '.xlsx', '.xls'];
@@ -134,6 +135,9 @@ export default function DataSources() {
   const [confirming, setConfirming] = useState(null);
 
   useEffect(() => {
+    // Start waking the analysis service now, so it is up by the time a file is
+    // chosen rather than only starting to boot on submit.
+    warmAnalysisService();
     (async () => {
       dispatch(fetchSourcesStart());
       try {
@@ -168,7 +172,12 @@ export default function DataSources() {
           </h1>
         </div>
         {!showUpload && (
-          <button onClick={() => setShowUpload(true)} className="btn-primary">Add source</button>
+          <button
+            onClick={() => { warmAnalysisService(); setShowUpload(true); }}
+            className="btn-primary"
+          >
+            Add source
+          </button>
         )}
       </div>
 

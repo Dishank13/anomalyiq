@@ -1,13 +1,25 @@
 const axios = require('axios');
 const logger = require('../lib/logger');
 
-// Render free instances spin down after 15 minutes, so the first call after an
-// idle period can take ~50s to wake the service.
+// Render free instances spin down after 15 minutes of inactivity. The first
+// request after that has to wake the service, which takes 25-50s, and while it
+// is waking Render's edge rejects requests outright -- with 429 rather than a
+// 503, which is why this used to surface as a nonsensical "Too Many Requests".
 const REQUEST_TIMEOUT = Number(process.env.PYTHON_TIMEOUT_MS || 90000);
-const RETRY_DELAY_MS = Number(process.env.PYTHON_RETRY_DELAY_MS || 2000);
 
-// Transient upstream failures worth one retry. A cold-starting or briefly
-// rate-limited free instance answers fine a couple of seconds later.
+// Backoff schedule, in ms, for the gaps between attempts.
+//
+// The old behaviour was a single retry after 2s. A cold start takes an order of
+// magnitude longer than that, so both attempts landed inside the wake-up window
+// and the user saw a failure for a service that was simply still booting. This
+// schedule spans ~42s of waiting, which covers a normal cold start, and gives
+// up rather than hanging forever if the service is genuinely down.
+const RETRY_SCHEDULE_MS = (process.env.PYTHON_RETRY_SCHEDULE || '1000,3000,6000,12000,20000')
+  .split(',').map((n) => Number(n.trim())).filter((n) => Number.isFinite(n) && n >= 0);
+
+// Transient upstream failures worth waiting out. 429 is included because that
+// is what a spinning-up free instance returns, not because we are being rate
+// limited -- see the comment above.
 const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
 const RETRYABLE_CODES = new Set(['ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ETIMEDOUT']);
 
@@ -19,6 +31,23 @@ function isRetryable(error) {
   if (RETRYABLE_CODES.has(error.code)) return true;
   return Boolean(error.response && RETRYABLE_STATUSES.has(error.response.status));
 }
+
+/** Respect the server's own Retry-After when present, else use the schedule. */
+function retryDelay(error, attempt) {
+  const scheduled = RETRY_SCHEDULE_MS[attempt] != null
+    ? RETRY_SCHEDULE_MS[attempt]
+    : RETRY_SCHEDULE_MS[RETRY_SCHEDULE_MS.length - 1] || 2000;
+
+  const header = error.response && error.response.headers &&
+    (error.response.headers['retry-after'] || error.response.headers['Retry-After']);
+  if (header) {
+    const seconds = Number(header);
+    // Cap it: a wildly large Retry-After must not hold the request open.
+    if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds * 1000, 30000);
+  }
+  return scheduled;
+}
+
 
 function bodySnippet(data) {
   if (!data) return '';
@@ -50,10 +79,13 @@ function describeError(error) {
       return { status: 404, message: detail || 'Not found in the analysis service.' };
     }
     if (RETRYABLE_STATUSES.has(res.status)) {
+      // Deliberately does not repeat the upstream status. A 429 here means the
+      // instance is still booting, and telling a user "Too Many Requests" when
+      // they have made one request is actively misleading.
       return {
         status: 503,
-        message: 'The analysis service is busy or waking up. Please try again in a moment.' +
-                 (detail ? ` (upstream ${res.status}: ${detail})` : ` (upstream ${res.status})`)
+        message: 'The analysis service is still starting up. This can take up to a ' +
+                 'minute on the free tier — please try again shortly.'
       };
     }
     return {
@@ -85,7 +117,9 @@ async function callPython(path, payload, { requestId } = {}) {
   const log = logger.child({ requestId, upstream: path });
   let lastError;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const maxAttempts = RETRY_SCHEDULE_MS.length + 1;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const startedAt = Date.now();
     try {
       const res = await axios.post(url, payload, {
@@ -94,19 +128,26 @@ async function callPython(path, payload, { requestId } = {}) {
         timeout: REQUEST_TIMEOUT,
         headers: requestId ? { 'X-Request-Id': requestId } : {}
       });
-      log.info({ ms: Date.now() - startedAt, attempt }, 'python call succeeded');
+      if (attempt > 0) {
+        log.info({ attempt }, 'python call succeeded after waiting out a cold start');
+      } else {
+        log.info({ ms: Date.now() - startedAt }, 'python call succeeded');
+      }
       return res.data;
     } catch (error) {
       lastError = error;
-      if (attempt === 0 && isRetryable(error)) {
-        log.warn(
-          { status: error.response ? error.response.status : error.code, ms: Date.now() - startedAt },
-          'python call failed, retrying once'
-        );
-        await sleep(RETRY_DELAY_MS);
-        continue;
-      }
-      break;
+      const isLast = attempt === maxAttempts - 1;
+      if (isLast || !isRetryable(error)) break;
+
+      const delay = retryDelay(error, attempt);
+      log.warn({
+        status: error.response ? error.response.status : error.code,
+        ms: Date.now() - startedAt,
+        attempt: attempt + 1,
+        of: maxAttempts,
+        retryInMs: delay
+      }, 'python call failed, retrying');
+      await sleep(delay);
     }
   }
 

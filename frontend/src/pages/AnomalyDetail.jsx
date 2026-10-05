@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import api from '../services/api';
 import socket from '../services/socket';
+import warmAnalysisService from '../services/warm';
 import AnalysisConfig from '../components/AnalysisConfig';
 import AnomalyChart, { compact, full } from '../components/AnomalyChart';
 import {
@@ -40,6 +41,7 @@ export default function AnomalyDetail() {
 
   /* ── initial load */
   useEffect(() => {
+    warmAnalysisService();
     let cancelled = false;
     (async () => {
       try {
