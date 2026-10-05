@@ -2,7 +2,8 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import api from '../services/api';
 import socket from '../services/socket';
-import warmAnalysisService from '../services/warm';
+import warmAnalysisService, { ensureAwake } from '../services/warm';
+import ServiceStatus from '../components/ServiceStatus';
 import AnalysisConfig from '../components/AnalysisConfig';
 import AnomalyChart, { compact, full } from '../components/AnomalyChart';
 import {
@@ -166,8 +167,18 @@ export default function AnomalyDetail() {
     setAnalyzing(true);
     setSelected(null);
     setShowConfig(false);
-    setJob({ status: 'queued', progress: 0, stage: 'queued' });
+    setJob({ status: 'queued', progress: 0, stage: 'waking the analysis service' });
     try {
+      // See services/warm.js: the API cannot spin this service up itself.
+      const awake = await ensureAwake();
+      if (!awake) {
+        setJob(null);
+        setAnalyzing(false);
+        toast('The analysis service could not be reached. Please try again shortly.', 'error');
+        return;
+      }
+      setJob({ status: 'queued', progress: 0, stage: 'queued' });
+
       const body = {};
       if (config.columns.length) body.columns = config.columns;
       if (config.methods.length) body.methods = config.methods;
@@ -258,6 +269,7 @@ export default function AnomalyDetail() {
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <ServiceStatus className="mr-1" />
           <button onClick={() => setShowConfig((v) => !v)} className="btn-ghost">Configure</button>
           <button onClick={runAnalysis} disabled={analyzing} className="btn-primary">
             {analyzing ? 'Running…' : 'Run analysis'}

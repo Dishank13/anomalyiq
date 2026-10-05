@@ -9,6 +9,7 @@ import os
 from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import numpy as np
@@ -20,6 +21,29 @@ import detection
 from loaders import clean_records, coerce_numeric, json_safe, load_dataframe
 
 app = FastAPI(title="AnomalyIQ detection service")
+
+# The browser calls /healthz directly to wake this service.
+#
+# This is not an aesthetic choice. Render refuses to spin up a sleeping free
+# instance for traffic originating inside its own network -- the edge answers
+# 429 and the service stays asleep, which was measured at over nine minutes of
+# continuous requests from the API with no effect. An external client wakes it
+# in ~25s. The user's browser is such a client, so the frontend pings this
+# endpoint on page load and the service is warm by the time work is submitted.
+CORS_ORIGINS = [o.strip() for o in os.getenv(
+    "CORS_ORIGINS",
+    "https://anomalyiq.vercel.app,http://localhost:3000"
+).split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    # Vercel preview deployments.
+    allow_origin_regex=r"https://[a-z0-9-]+\.vercel\.app",
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Request-Id"],
+    max_age=3600,
+)
 
 # Hard cap on anomalies returned, so one pathological file cannot write
 # thousands of documents and flood the websocket.

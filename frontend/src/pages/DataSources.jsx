@@ -5,7 +5,8 @@ import {
   addSource, fetchSourcesFailure, fetchSourcesStart, fetchSourcesSuccess, removeSource
 } from '../store/slices/dataSlice';
 import api from '../services/api';
-import warmAnalysisService from '../services/warm';
+import warmAnalysisService, { ensureAwake } from '../services/warm';
+import ServiceStatus from '../components/ServiceStatus';
 import { AppShell, EmptyState, Skeleton, useToast } from '../components/ui';
 
 const ACCEPTED = ['.csv', '.xlsx', '.xls'];
@@ -22,6 +23,7 @@ function UploadPanel({ onClose, onUploaded }) {
   const [file, setFile] = useState(null);
   const [dragging, setDragging] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [waking, setWaking] = useState(false);
   const [error, setError] = useState(null);
 
   const accept = (chosen) => {
@@ -49,6 +51,18 @@ function UploadPanel({ onClose, onUploaded }) {
     setSubmitting(true);
     setError(null);
     try {
+      // The API cannot wake the detection service itself, so make sure it is
+      // up before handing it work -- otherwise this upload is a guaranteed
+      // failure rather than a slow success.
+      setWaking(true);
+      const awake = await ensureAwake();
+      setWaking(false);
+      if (!awake) {
+        setError('The analysis service could not be reached. Please try again in a moment.');
+        setSubmitting(false);
+        return;
+      }
+
       const form = new FormData();
       form.append('name', name.trim());
       form.append('file', file);
@@ -119,9 +133,10 @@ function UploadPanel({ onClose, onUploaded }) {
 
       <div className="mt-5 flex gap-2 border-t border-rule pt-4">
         <button type="submit" disabled={submitting} className="btn-primary">
-          {submitting ? 'Uploading…' : 'Add source'}
+          {waking ? 'Starting the service…' : submitting ? 'Uploading…' : 'Add source'}
         </button>
         <button type="button" onClick={onClose} className="btn-ghost">Cancel</button>
+        <ServiceStatus className="ml-auto" />
       </div>
     </form>
   );
